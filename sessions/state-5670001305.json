@@ -1,0 +1,49 @@
+{
+  "cookies": [
+    {
+      "name": "echannelweb_route",
+      "value": "11b909607c46cbcc5de21a74e497cfda",
+      "domain": "my.te.eg",
+      "path": "/",
+      "expires": 1770486717.068742,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "echannelapp_route_1",
+      "value": "e597a78eb287d85e4ce5aa6117e80e1d",
+      "domain": "my.te.eg",
+      "path": "/",
+      "expires": 1770486717.836326,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "TS01fa9144",
+      "value": "010aa23b1db64a941129c08f94322b1fed55a6540b23ea75b4568ad718c5f318f3a9c0f5a04389112e41437ddb037d9cb46d5824ed4af43de3adc79f634007ddd9629688a1ed1a55a3f5d3b778101a5fedc18d5079",
+      "domain": "my.te.eg",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://my.te.eg",
+      "localStorage": [
+        {
+          "name": "lastRoute",
+          "value": "/login"
+        },
+        {
+          "name": "isCorporateLogin",
+          "value": "N"
+        }
+      ]
+    }
+  ]
+}
