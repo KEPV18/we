@@ -7,6 +7,20 @@ const DEBUG = String(process.env.DEBUG_WE || '').trim() === '1';
 
 function debugLog(...args) { if (DEBUG) console.log('[WE-DEBUG]', ...args); }
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+function isClosedContextError(err) {
+  const msg = String(err?.message || err || '');
+  return (
+    msg.includes('Target page, context or browser has been closed') ||
+    msg.includes('page.goto: Target closed') ||
+    msg.includes('Target closed') ||
+    msg.includes('has been closed')
+  );
+}
+
+function isMissingBrowserError(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('Executable doesn\'t exist at') || msg.includes('Please run the following command to download new browsers');
+}
 
 function statePath(chatId) {
   return path.join(__dirname, 'sessions', `state-${chatId}.json`);
@@ -47,7 +61,13 @@ function pickRenewPriceFromEGPs({ egpValues, balanceEGP, routerMonthlyEGP }) {
 }
 
 async function loginAndSave(chatId, serviceNumber, password) {
-  const browser = await chromium.launch({ headless: true });
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (err) {
+    if (isMissingBrowserError(err)) throw new Error('BROWSER_NOT_INSTALLED');
+    throw err;
+  }
   const context = await browser.newContext();
   const page = await context.newPage();
   page.setDefaultTimeout(120000);
@@ -89,7 +109,13 @@ async function openAccountOverviewWithSession(chatId, headless = true) {
   const sp = statePath(chatId);
   if (!fs.existsSync(sp)) throw new Error('NO_SESSION');
 
-  const browser = await chromium.launch({ headless });
+  let browser;
+  try {
+    browser = await chromium.launch({ headless });
+  } catch (err) {
+    if (isMissingBrowserError(err)) throw new Error('BROWSER_NOT_INSTALLED');
+    throw err;
+  }
   const context = await browser.newContext({ storageState: sp });
   const page = await context.newPage();
   page.setDefaultTimeout(120000);
@@ -384,103 +410,123 @@ function pickBest(results) {
 
 
 async function fetchWithSession(chatId) {
-  const { browser, page } = await openAccountOverviewWithSession(chatId, true);
+  let browser;
+  let page;
 
-  if (DEBUG) {
-    await page.screenshot({ path: debugShotPath(chatId, '00-accountoverview') }).catch(() => {});
-    debugLog('URL:', page.url());
+  try {
+    ({ browser, page } = await openAccountOverviewWithSession(chatId, true));
+
+    if (DEBUG) {
+      await page.screenshot({ path: debugShotPath(chatId, '00-accountoverview') }).catch(() => {});
+      debugLog('URL:', page.url());
+    }
+
+    // ✅ أهم إضافة: استنى الصفحة تبقى جاهزة قبل plan
+    await waitForOverviewReady(page, chatId);
+
+    const plan = await extractPlanRobust(page);
+
+    const remainingBox = page.locator(SEL.remainingSpan, { hasText: SEL.remainingHasText }).first().locator('xpath=..');
+    const usedBox = page.locator(SEL.usedSpan, { hasText: SEL.usedHasText }).first().locator('xpath=..');
+    const balBlock = page.locator(SEL.balanceText).locator('xpath=..');
+
+    const remainingGB = numFromText(await remainingBox.innerText().catch(() => ''));
+    const usedGB = numFromText(await usedBox.innerText().catch(() => ''));
+    const balanceEGP = numFromText(await balBlock.innerText().catch(() => ''));
+
+    async function runMethod(methodFn) {
+      try {
+        await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' });
+      } catch (err) {
+        if (isClosedContextError(err)) {
+          throw new Error('BROWSER_CLOSED_DURING_FETCH');
+        }
+        throw err;
+      }
+      await page.waitForTimeout(3500);
+      return methodFn(page, chatId, balanceEGP);
+    }
+
+    const rA = await runMethod(extractMethodA);
+    const rB = await runMethod(extractMethodB);
+    const rC = await runMethod(extractMethodC);
+
+    const picked = pickBest([rA, rB, rC]);
+    debugLog('Methods scored:', picked.all.map(x => ({ method: x.method, score: x._score, reason: x.reason })));
+
+    const chosen = picked.best;
+
+    const totalRenewEGP = ((chosen.renewPriceEGP ?? 0) + (chosen.routerMonthlyEGP ?? 0)) || null;
+    const canAfford = totalRenewEGP != null && balanceEGP != null ? balanceEGP >= totalRenewEGP : null;
+
+    return {
+      plan,
+      remainingGB,
+      usedGB,
+      balanceEGP,
+
+      renewalDate: chosen.renewalDate,
+      remainingDays: chosen.remainingDays,
+      renewPriceEGP: chosen.renewPriceEGP,
+      renewBtnEnabled: chosen.renewBtnEnabled,
+
+      routerName: chosen.routerName,
+      routerMonthlyEGP: chosen.routerMonthlyEGP,
+      routerRenewalDate: chosen.routerRenewalDate,
+
+      totalRenewEGP,
+      canAfford,
+
+      capturedAt: new Date().toISOString(),
+      _pickedMethod: chosen.method,
+      _methods: picked.all.map(x => ({
+        method: x.method,
+        score: x._score,
+        reason: x.reason,
+        renewalDate: x.renewalDate,
+        remainingDays: x.remainingDays,
+        renewPriceEGP: x.renewPriceEGP,
+        routerMonthlyEGP: x.routerMonthlyEGP,
+        routerRenewalDate: x.routerRenewalDate,
+        renewBtnEnabled: x.renewBtnEnabled,
+      })),
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
-
-  // ✅ أهم إضافة: استنى الصفحة تبقى جاهزة قبل plan
-  await waitForOverviewReady(page, chatId);
-
-  const plan = await extractPlanRobust(page);
-
-  const remainingBox = page.locator(SEL.remainingSpan, { hasText: SEL.remainingHasText }).first().locator('xpath=..');
-  const usedBox = page.locator(SEL.usedSpan, { hasText: SEL.usedHasText }).first().locator('xpath=..');
-  const balBlock = page.locator(SEL.balanceText).locator('xpath=..');
-
-  const remainingGB = numFromText(await remainingBox.innerText().catch(() => ''));
-  const usedGB = numFromText(await usedBox.innerText().catch(() => ''));
-  const balanceEGP = numFromText(await balBlock.innerText().catch(() => ''));
-
-  async function runMethod(methodFn) {
-    await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(3500);
-    return methodFn(page, chatId, balanceEGP);
-  }
-
-  const rA = await runMethod(extractMethodA);
-  const rB = await runMethod(extractMethodB);
-  const rC = await runMethod(extractMethodC);
-
-  const picked = pickBest([rA, rB, rC]);
-  debugLog('Methods scored:', picked.all.map(x => ({ method: x.method, score: x._score, reason: x.reason })));
-
-  await browser.close();
-
-  const chosen = picked.best;
-
-  const totalRenewEGP = ((chosen.renewPriceEGP ?? 0) + (chosen.routerMonthlyEGP ?? 0)) || null;
-  const canAfford = totalRenewEGP != null && balanceEGP != null ? balanceEGP >= totalRenewEGP : null;
-
-  return {
-    plan,
-    remainingGB,
-    usedGB,
-    balanceEGP,
-
-    renewalDate: chosen.renewalDate,
-    remainingDays: chosen.remainingDays,
-    renewPriceEGP: chosen.renewPriceEGP,
-    renewBtnEnabled: chosen.renewBtnEnabled,
-
-    routerName: chosen.routerName,
-    routerMonthlyEGP: chosen.routerMonthlyEGP,
-    routerRenewalDate: chosen.routerRenewalDate,
-
-    totalRenewEGP,
-    canAfford,
-
-    capturedAt: new Date().toISOString(),
-    _pickedMethod: chosen.method,
-    _methods: picked.all.map(x => ({
-      method: x.method,
-      score: x._score,
-      reason: x.reason,
-      renewalDate: x.renewalDate,
-      remainingDays: x.remainingDays,
-      renewPriceEGP: x.renewPriceEGP,
-      routerMonthlyEGP: x.routerMonthlyEGP,
-      routerRenewalDate: x.routerRenewalDate,
-      renewBtnEnabled: x.renewBtnEnabled,
-    })),
-  };
 }
 
 async function renewWithSession(chatId) {
-  const { browser, page } = await openAccountOverviewWithSession(chatId, true);
+  let browser;
+  try {
+    const opened = await openAccountOverviewWithSession(chatId, true);
+    browser = opened.browser;
+    const page = opened.page;
 
-  const md = await openMoreDetails(page, chatId);
-  if (!md.ok) {
-    await browser.close();
-    throw new Error(md.reason || 'MORE_DETAILS_NOT_FOUND');
+    const md = await openMoreDetails(page, chatId);
+    if (!md.ok) {
+      throw new Error(md.reason || 'MORE_DETAILS_NOT_FOUND');
+    }
+
+    const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
+    await renewBtn.waitFor({ state: 'visible', timeout: 20000 });
+
+    const dis = await renewBtn.getAttribute('disabled');
+    if (dis !== null) {
+      throw new Error('RENEW_DISABLED');
+    }
+
+    await renewBtn.click({ force: true });
+    await page.waitForTimeout(5000);
+    return true;
+  } catch (err) {
+    if (isClosedContextError(err)) {
+      throw new Error('BROWSER_CLOSED_DURING_RENEW');
+    }
+    throw err;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
-
-  const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
-  await renewBtn.waitFor({ state: 'visible', timeout: 20000 });
-
-  const dis = await renewBtn.getAttribute('disabled');
-  if (dis !== null) {
-    await browser.close();
-    throw new Error('RENEW_DISABLED');
-  }
-
-  await renewBtn.click({ force: true });
-  await page.waitForTimeout(5000);
-
-  await browser.close();
-  return true;
 }
 
 function deleteSession(chatId) {
