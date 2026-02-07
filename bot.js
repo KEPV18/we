@@ -50,6 +50,13 @@ function toInt(n) {
   return String(Math.round(Number(n)));
 }
 
+function describeError(err) {
+  const msg = String(err?.message || err || '');
+  const code = err?.code || err?.errno || 'NO_CODE';
+  const type = err?.type || 'NO_TYPE';
+  return `${msg} [code=${code}, type=${type}]`;
+}
+
 function calcDailyQuota(remainingGB, remainingDays) {
   if (remainingGB == null || remainingDays == null || remainingDays <= 0) return null;
   return remainingGB / remainingDays;
@@ -106,7 +113,9 @@ function isProbablyWeSlowness(err) {
     msg.includes('MORE_NOT_VISIBLE') ||
     msg.includes('RENEWAL_NOT_FOUND') ||
     msg.includes('Execution context') ||
-    msg.includes('Target closed')
+    msg.includes('Target closed') ||
+    msg.includes('BROWSER_CLOSED_DURING_FETCH') ||
+    msg.includes('BROWSER_CLOSED_DURING_RENEW')
   );
 }
 
@@ -163,6 +172,15 @@ async function runFetchWithProgress(ctx, chatId, options = {}) {
       if (msg.includes('SESSION_EXPIRED')) {
         await safeReply('⚠️ السيشن انتهت. ابعت /link وسجّل دخول تاني.');
         throw err;
+      }
+
+      if (msg.includes('BROWSER_NOT_INSTALLED')) {
+        await safeReply('⚠️ المتصفح المطلوب للتشغيل (Playwright Chromium) مش متثبت على السيرفر. ثبّته الأول وبعدين جرّب /status.');
+        throw err;
+      }
+
+      if (msg.includes('BROWSER_CLOSED_DURING_FETCH')) {
+        await safeReply('⚠️ حصل Reset في المتصفح أثناء السحب. هحاول تلقائيًا من جديد.');
       }
 
       const idx = Math.min(attempt - 1, BACKOFF_MINUTES.length - 1);
@@ -264,6 +282,10 @@ bot.command('renew', (ctx) => {
       await ctx.reply('⚠️ محتاج /link من جديد.', mainKeyboard());
       return;
     }
+    if (msg.includes('BROWSER_NOT_INSTALLED')) {
+      await ctx.reply('⚠️ التشغيل محتاج Playwright Chromium ومش موجود على السيرفر حاليًا.', mainKeyboard());
+      return;
+    }
     await ctx.reply(`⚠️ فشل Renew: ${msg}`, mainKeyboard());
   });
 });
@@ -275,8 +297,30 @@ bot.hears('♻️ Renew', (ctx) => ctx.reply('/renew'));
 bot.hears('🚪 Logout', (ctx) => ctx.reply('/logout'));
 bot.hears('📅 Today', (ctx) => {
   const chatId = ctx.chat.id;
-  runFetchWithProgress(ctx, chatId, { maxTotalMinutes: 60, progressEveryMinutes: 2 })
-    .catch(() => {});
+
+  (async () => {
+    const todayUsage = await getTodayUsage(chatId);
+    const avgUsage = await getAvgDailyUsage(chatId);
+    await ctx.reply(
+      `📅 استهلاك النهاردة: ${to2(todayUsage)} GB\n` +
+      `📈 متوسط يومي (آخر أيام): ${avgUsage != null ? `${to2(avgUsage)} GB/يوم` : 'غير متاح'}`,
+      mainKeyboard()
+    );
+  })().catch(() => {
+    runFetchWithProgress(ctx, chatId, { maxTotalMinutes: 60, progressEveryMinutes: 2 })
+      .catch(() => {});
+  });
+});
+
+bot.command('today', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const todayUsage = await getTodayUsage(chatId).catch(() => 0);
+  const avgUsage = await getAvgDailyUsage(chatId).catch(() => null);
+  await ctx.reply(
+    `📅 استهلاك النهاردة: ${to2(todayUsage)} GB\n` +
+    `📈 متوسط يومي (آخر أيام): ${avgUsage != null ? `${to2(avgUsage)} GB/يوم` : 'غير متاح'}`,
+    mainKeyboard()
+  );
 });
 
 // Link wizard message handler
@@ -312,6 +356,10 @@ bot.on('text', async (ctx) => {
       runFetchWithProgress(ctx, chatId, { maxTotalMinutes: 60, progressEveryMinutes: 2 }).catch(() => {});
     } catch (err) {
       const msg = String(err?.message || err || '');
+      if (msg.includes('BROWSER_NOT_INSTALLED')) {
+        await ctx.reply('⚠️ مش قادر أفتح المتصفح لأن Playwright Chromium غير مثبت على السيرفر.', mainKeyboard());
+        return;
+      }
       await ctx.reply(`⚠️ فشل ربط الحساب: ${msg}\nجرّب /link تاني.`, mainKeyboard());
     }
   }
@@ -329,5 +377,33 @@ bot.catch((err) => {
   console.error('Unhandled bot error:', err);
 });
 
-// launch
-bot.launch().then(() => console.log('Bot running...'));
+async function launchBotWithRetry() {
+  const maxAttempts = Number(process.env.BOT_LAUNCH_MAX_ATTEMPTS || 5);
+  const retryDelayMs = Number(process.env.BOT_LAUNCH_RETRY_MS || 15000);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await bot.launch();
+      console.log('Bot running...');
+      return true;
+    } catch (err) {
+      const details = describeError(err);
+      console.error(`Bot launch failed (attempt ${attempt}/${maxAttempts}):`, details);
+      if (attempt >= maxAttempts) {
+        console.error('Bot launch failed permanently. Check network/BOT_TOKEN and retry later.');
+        return false;
+      }
+      await sleep(retryDelayMs);
+    }
+  }
+
+  return false;
+}
+
+if (require.main === module) {
+  launchBotWithRetry().catch((err) => {
+    console.error('Fatal launch error:', describeError(err));
+  });
+}
+
+module.exports = { bot, launchBotWithRetry };

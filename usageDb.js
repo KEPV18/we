@@ -7,6 +7,12 @@ function safeAlter(sql) {
   });
 }
 
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (e, rows) => (e ? reject(e) : resolve(rows || [])));
+  });
+}
+
 function initUsageDb() {
   db.serialize(() => {
     db.run(`
@@ -74,6 +80,11 @@ function insertSnapshot(chatId, s) {
   });
 }
 
+async function saveSnapshot(chatId, snapshot) {
+  if (!snapshot || !snapshot.capturedAt) throw new Error('INVALID_SNAPSHOT');
+  return insertSnapshot(chatId, snapshot);
+}
+
 function getFirstOfDay(chatId, day) {
   return new Promise((resolve, reject) => {
     db.get(
@@ -94,4 +105,51 @@ function getLastOfDay(chatId, day) {
   });
 }
 
-module.exports = { initUsageDb, insertSnapshot, getFirstOfDay, getLastOfDay };
+async function getTodayUsage(chatId, now = new Date()) {
+  const day = now.toISOString().slice(0, 10);
+  const [first, last] = await Promise.all([
+    getFirstOfDay(chatId, day),
+    getLastOfDay(chatId, day),
+  ]);
+
+  if (!first || !last) return 0;
+  if (first.usedGB == null || last.usedGB == null) return 0;
+
+  const delta = Number(last.usedGB) - Number(first.usedGB);
+  return delta > 0 ? delta : 0;
+}
+
+async function getAvgDailyUsage(chatId, days = 14) {
+  const rows = await dbAll(
+    `
+      SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
+      FROM snapshots
+      WHERE chatId = ? AND usedGB IS NOT NULL
+      GROUP BY day
+      ORDER BY day DESC
+      LIMIT ?
+    `,
+    [String(chatId), Number(days)]
+  );
+
+  if (!rows.length) return null;
+
+  const deltas = rows
+    .map((r) => Math.max(0, Number(r.maxUsed) - Number(r.minUsed)))
+    .filter((v) => Number.isFinite(v));
+
+  if (!deltas.length) return null;
+
+  const sum = deltas.reduce((a, b) => a + b, 0);
+  return sum / deltas.length;
+}
+
+module.exports = {
+  initUsageDb,
+  insertSnapshot,
+  saveSnapshot,
+  getFirstOfDay,
+  getLastOfDay,
+  getTodayUsage,
+  getAvgDailyUsage,
+};
