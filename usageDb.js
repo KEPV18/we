@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const db = new sqlite3.Database('./usage.db');
 
@@ -25,6 +27,17 @@ function dbRun(sql, params = []) {
   });
 }
 
+function cairoDay(isoOrDate = new Date()) {
+  const d = new Date(isoOrDate);
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Cairo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return fmt.format(d);
+}
+
 function initUsageDb() {
   db.serialize(() => {
     db.run(`
@@ -33,22 +46,18 @@ function initUsageDb() {
         chatId TEXT NOT NULL,
         day TEXT NOT NULL,
         capturedAt TEXT NOT NULL,
-
         usedGB REAL,
         remainingGB REAL,
         plan TEXT,
         balanceEGP REAL,
-
         renewalDate TEXT,
         remainingDays INTEGER,
         renewPriceEGP REAL,
-
         routerMonthlyEGP REAL,
         routerRenewalDate TEXT,
         totalRenewEGP REAL
       )
     `);
-
     db.run(`CREATE INDEX IF NOT EXISTS idx_snapshots_chat_day ON snapshots(chatId, day)`);
 
     db.run(`
@@ -73,6 +82,17 @@ function initUsageDb() {
       )
     `);
 
+    db.run(`
+      CREATE TABLE IF NOT EXISTS renew_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chatId TEXT NOT NULL,
+        status TEXT NOT NULL,
+        amountEGP REAL,
+        details TEXT,
+        createdAt TEXT NOT NULL
+      )
+    `);
+
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerMonthlyEGP REAL`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN totalRenewEGP REAL`);
@@ -81,8 +101,7 @@ function initUsageDb() {
 
 function insertSnapshot(chatId, s) {
   return new Promise((resolve, reject) => {
-    const day = s.capturedAt.slice(0, 10);
-
+    const day = cairoDay(s.capturedAt);
     db.run(
       `INSERT INTO snapshots(
         chatId, day, capturedAt,
@@ -92,95 +111,101 @@ function insertSnapshot(chatId, s) {
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         String(chatId), day, s.capturedAt,
-        s.usedGB ?? null,
-        s.remainingGB ?? null,
-        s.plan ?? null,
-        s.balanceEGP ?? null,
-        s.renewalDate ?? null,
-        s.remainingDays ?? null,
-        s.renewPriceEGP ?? null,
-        s.routerMonthlyEGP ?? null,
-        s.routerRenewalDate ?? null,
-        s.totalRenewEGP ?? null,
+        s.usedGB ?? null, s.remainingGB ?? null, s.plan ?? null, s.balanceEGP ?? null,
+        s.renewalDate ?? null, s.remainingDays ?? null, s.renewPriceEGP ?? null,
+        s.routerMonthlyEGP ?? null, s.routerRenewalDate ?? null, s.totalRenewEGP ?? null,
       ],
       (e) => (e ? reject(e) : resolve(day))
     );
   });
 }
 
-async function saveSnapshot(chatId, snapshot) {
+async function getLatestSnapshot(chatId) {
+  return dbGet(`SELECT * FROM snapshots WHERE chatId=? ORDER BY capturedAt DESC LIMIT 1`, [String(chatId)]);
+}
+
+async function saveSnapshot(chatId, snapshot, opts = {}) {
   if (!snapshot || !snapshot.capturedAt) throw new Error('INVALID_SNAPSHOT');
+  const minIntervalMinutes = Number(opts.minIntervalMinutes ?? 0);
+  if (minIntervalMinutes > 0 && !opts.force) {
+    const last = await getLatestSnapshot(chatId);
+    if (last?.capturedAt) {
+      const diffMs = new Date(snapshot.capturedAt).getTime() - new Date(last.capturedAt).getTime();
+      if (diffMs >= 0 && diffMs < minIntervalMinutes * 60 * 1000) return last.day;
+    }
+  }
   return insertSnapshot(chatId, snapshot);
 }
 
 function getFirstOfDay(chatId, day) {
-  return dbGet(
-    `SELECT * FROM snapshots WHERE chatId=? AND day=? ORDER BY capturedAt ASC LIMIT 1`,
-    [String(chatId), day]
-  );
+  return dbGet(`SELECT * FROM snapshots WHERE chatId=? AND day=? ORDER BY capturedAt ASC LIMIT 1`, [String(chatId), day]);
 }
 
 function getLastOfDay(chatId, day) {
-  return dbGet(
-    `SELECT * FROM snapshots WHERE chatId=? AND day=? ORDER BY capturedAt DESC LIMIT 1`,
-    [String(chatId), day]
-  );
+  return dbGet(`SELECT * FROM snapshots WHERE chatId=? AND day=? ORDER BY capturedAt DESC LIMIT 1`, [String(chatId), day]);
 }
 
 async function getTodayUsage(chatId, now = new Date()) {
-  const day = now.toISOString().slice(0, 10);
-  const [first, last] = await Promise.all([getFirstOfDay(chatId, day), getLastOfDay(chatId, day)]);
-  if (!first || !last) return 0;
-  if (first.usedGB == null || last.usedGB == null) return 0;
-  return Math.max(0, Number(last.usedGB) - Number(first.usedGB));
+  const day = cairoDay(now);
+  const rows = await dbAll(
+    `SELECT MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed FROM snapshots WHERE chatId=? AND day=? AND usedGB IS NOT NULL`,
+    [String(chatId), day]
+  );
+  const r = rows[0];
+  if (!r || r.minUsed == null || r.maxUsed == null) return 0;
+  const delta = Number(r.maxUsed) - Number(r.minUsed);
+  if (delta >= 0) return delta;
+  return Number(r.maxUsed) || 0;
 }
 
 async function getAvgDailyUsage(chatId, days = 14) {
   const rows = await dbAll(
-    `
-      SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
-      FROM snapshots
-      WHERE chatId = ? AND usedGB IS NOT NULL
-      GROUP BY day
-      ORDER BY day DESC
-      LIMIT ?
-    `,
+    `SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
+     FROM snapshots
+     WHERE chatId = ? AND usedGB IS NOT NULL
+     GROUP BY day
+     ORDER BY day DESC
+     LIMIT ?`,
     [String(chatId), Number(days)]
   );
-
   if (!rows.length) return null;
-  const deltas = rows
-    .map((r) => Math.max(0, Number(r.maxUsed) - Number(r.minUsed)))
-    .filter((v) => Number.isFinite(v));
+  const deltas = rows.map((r) => {
+    const d = Number(r.maxUsed) - Number(r.minUsed);
+    return d >= 0 ? d : Number(r.maxUsed) || 0;
+  }).filter((v) => Number.isFinite(v));
   if (!deltas.length) return null;
   return deltas.reduce((a, b) => a + b, 0) / deltas.length;
 }
 
-async function getMonthUsage(chatId, now = new Date()) {
-  const monthPrefix = now.toISOString().slice(0, 7); // YYYY-MM
+async function getRangeUsage(chatId, days = 7) {
   const rows = await dbAll(
-    `
-      SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
-      FROM snapshots
-      WHERE chatId = ? AND day LIKE ? AND usedGB IS NOT NULL
-      GROUP BY day
-      ORDER BY day ASC
-    `,
-    [String(chatId), `${monthPrefix}%`]
+    `SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
+     FROM snapshots
+     WHERE chatId = ? AND usedGB IS NOT NULL
+     GROUP BY day
+     ORDER BY day DESC
+     LIMIT ?`,
+    [String(chatId), Number(days)]
   );
-
-  if (!rows.length) return 0;
-  return rows
-    .map((r) => Math.max(0, Number(r.maxUsed) - Number(r.minUsed)))
-    .filter((v) => Number.isFinite(v))
-    .reduce((a, b) => a + b, 0);
+  return rows.map((r) => {
+    const d = Number(r.maxUsed) - Number(r.minUsed);
+    return { day: r.day, usage: d >= 0 ? d : Number(r.maxUsed) || 0 };
+  }).reverse();
 }
 
-async function getLatestSnapshot(chatId) {
-  return dbGet(
-    `SELECT * FROM snapshots WHERE chatId=? ORDER BY capturedAt DESC LIMIT 1`,
-    [String(chatId)]
+async function getMonthUsage(chatId, now = new Date()) {
+  const monthPrefix = cairoDay(now).slice(0, 7);
+  const rows = await dbAll(
+    `SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
+     FROM snapshots
+     WHERE chatId = ? AND day LIKE ? AND usedGB IS NOT NULL
+     GROUP BY day`,
+    [String(chatId), `${monthPrefix}%`]
   );
+  return rows.reduce((sum, r) => {
+    const d = Number(r.maxUsed) - Number(r.minUsed);
+    return sum + (d >= 0 ? d : Number(r.maxUsed) || 0);
+  }, 0);
 }
 
 async function upsertReminderSettings(chatId, patch = {}) {
@@ -191,60 +216,51 @@ async function upsertReminderSettings(chatId, patch = {}) {
     monthlyRatio: patch.monthlyRatio ?? current.monthlyRatio,
   };
   const nowIso = new Date().toISOString();
-
   await dbRun(
-    `
-      INSERT INTO reminder_settings(chatId, enabled, dailyMultiplier, monthlyRatio, createdAt, updatedAt)
-      VALUES(?,?,?,?,?,?)
-      ON CONFLICT(chatId) DO UPDATE SET
-        enabled=excluded.enabled,
-        dailyMultiplier=excluded.dailyMultiplier,
-        monthlyRatio=excluded.monthlyRatio,
-        updatedAt=excluded.updatedAt
-    `,
+    `INSERT INTO reminder_settings(chatId, enabled, dailyMultiplier, monthlyRatio, createdAt, updatedAt)
+     VALUES(?,?,?,?,?,?)
+     ON CONFLICT(chatId) DO UPDATE SET
+      enabled=excluded.enabled,
+      dailyMultiplier=excluded.dailyMultiplier,
+      monthlyRatio=excluded.monthlyRatio,
+      updatedAt=excluded.updatedAt`,
     [String(chatId), merged.enabled ? 1 : 0, Number(merged.dailyMultiplier), Number(merged.monthlyRatio), nowIso, nowIso]
   );
-
   return getReminderSettings(chatId);
 }
 
 async function getReminderSettings(chatId) {
   const row = await dbGet(`SELECT * FROM reminder_settings WHERE chatId=?`, [String(chatId)]);
-  if (!row) {
-    return {
-      chatId: String(chatId),
-      enabled: 1,
-      dailyMultiplier: 1.6,
-      monthlyRatio: 1.2,
-    };
-  }
+  if (!row) return { chatId: String(chatId), enabled: 1, dailyMultiplier: 1.6, monthlyRatio: 1.2 };
   return row;
 }
 
 async function getTrackedChatIds() {
-  const rows = await dbAll(
-    `
-      SELECT chatId FROM snapshots
-      UNION
-      SELECT chatId FROM reminder_settings
-    `
-  );
+  const rows = await dbAll(`SELECT chatId FROM snapshots UNION SELECT chatId FROM reminder_settings`);
   return rows.map((r) => String(r.chatId));
 }
 
-async function wasAlertSent(chatId, alertKey, day = new Date().toISOString().slice(0, 10)) {
-  const row = await dbGet(
-    `SELECT id FROM alert_events WHERE chatId=? AND alertKey=? AND day=? LIMIT 1`,
-    [String(chatId), String(alertKey), String(day)]
-  );
+async function wasAlertSent(chatId, alertKey, day = cairoDay()) {
+  const row = await dbGet(`SELECT id FROM alert_events WHERE chatId=? AND alertKey=? AND day=? LIMIT 1`, [String(chatId), String(alertKey), String(day)]);
   return !!row;
 }
 
-async function markAlertSent(chatId, alertKey, day = new Date().toISOString().slice(0, 10)) {
-  await dbRun(
-    `INSERT OR IGNORE INTO alert_events(chatId, alertKey, day, createdAt) VALUES(?,?,?,?)`,
-    [String(chatId), String(alertKey), String(day), new Date().toISOString()]
-  );
+async function markAlertSent(chatId, alertKey, day = cairoDay()) {
+  await dbRun(`INSERT OR IGNORE INTO alert_events(chatId, alertKey, day, createdAt) VALUES(?,?,?,?)`, [String(chatId), String(alertKey), String(day), new Date().toISOString()]);
+  return true;
+}
+
+async function logRenewAction(chatId, status, amountEGP = null, details = '') {
+  await dbRun(`INSERT INTO renew_logs(chatId, status, amountEGP, details, createdAt) VALUES(?,?,?,?,?)`, [String(chatId), String(status), amountEGP == null ? null : Number(amountEGP), String(details || ''), new Date().toISOString()]);
+}
+
+async function wipeUserData(chatId) {
+  await dbRun(`DELETE FROM snapshots WHERE chatId=?`, [String(chatId)]);
+  await dbRun(`DELETE FROM reminder_settings WHERE chatId=?`, [String(chatId)]);
+  await dbRun(`DELETE FROM alert_events WHERE chatId=?`, [String(chatId)]);
+  await dbRun(`DELETE FROM renew_logs WHERE chatId=?`, [String(chatId)]);
+  const sp = path.join(__dirname, 'sessions', `state-${chatId}.json`);
+  if (fs.existsSync(sp)) fs.unlinkSync(sp);
   return true;
 }
 
@@ -256,6 +272,7 @@ module.exports = {
   getLastOfDay,
   getTodayUsage,
   getAvgDailyUsage,
+  getRangeUsage,
   getMonthUsage,
   getLatestSnapshot,
   getReminderSettings,
@@ -263,4 +280,7 @@ module.exports = {
   getTrackedChatIds,
   wasAlertSent,
   markAlertSent,
+  logRenewAction,
+  wipeUserData,
+  cairoDay,
 };
