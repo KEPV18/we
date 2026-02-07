@@ -134,10 +134,17 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
   const currentUrl = page.url();
   entry.diagnostics.currentUrl = currentUrl;
   if (currentUrl.includes('/signin') || currentUrl.includes('#/home/signin')) {
+    await page.waitForTimeout(1500).catch(() => {});
+    await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    const url2 = page.url();
+    entry.diagnostics.currentUrl = url2;
+    if (!(url2.includes('/signin') || url2.includes('#/home/signin'))) return page;
+
     if (retryOnce) {
       await ensureContext(chatId, true);
       return gotoOverview(chatId, { retryOnce: false });
     }
+    if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'SESSION_EXPIRED') }).catch(() => {});
     throw new Error('SESSION_EXPIRED');
   }
 
@@ -216,9 +223,11 @@ async function extractBasics(page) {
   };
 }
 
-function parseDetailsFromBody(bodyText, balanceEGP) {
+async function parseDetailsFromBody(page, bodyText, balanceEGP) {
   const parsed = parseRenewalLine(bodyText.match(/Renewal\s*Date:.*$/im)?.[0] || '');
-  const renewBtnEnabled = /\bRenew\b/i.test(bodyText) ? null : null;
+  const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
+  const renewVisible = await renewBtn.isVisible().catch(() => false);
+  const renewBtnEnabled = renewVisible ? ((await renewBtn.getAttribute('disabled').catch(() => 'disabled')) === null) : null;
   const idx = bodyText.toLowerCase().indexOf('premium router');
   let routerMonthlyEGP = null;
   let routerRenewalDate = null;
@@ -263,7 +272,7 @@ async function fetchWithSession(chatId) {
     entry.diagnostics.moreDetailsVisible = md.ok;
     if (md.ok) {
       const bodyText = await page.locator('body').innerText().catch(() => '');
-      details = { ...details, ...parseDetailsFromBody(bodyText, basics.balanceEGP) };
+      details = { ...details, ...(await parseDetailsFromBody(page, bodyText, basics.balanceEGP)) };
     } else {
       details._detailsUnavailable = md.reason || 'DETAILS_TEMP_UNAVAILABLE';
     }

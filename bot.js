@@ -105,6 +105,39 @@ function getState(chatId) {
   return fetchState.get(String(chatId));
 }
 
+
+async function getAvgDailyStable(chatId) {
+  return getAvgDailyUsage(chatId, 14, { excludeToday: true }).catch(() => null);
+}
+
+function mergeRenewFieldsIfMissing(data, prev) {
+  if (!prev) return data;
+  const fresh = data;
+  const out = { ...fresh };
+  const keys = ['renewalDate', 'remainingDays', 'renewPriceEGP', 'routerMonthlyEGP', 'routerRenewalDate', 'totalRenewEGP', 'canAfford'];
+  for (const k of keys) {
+    if ((out[k] == null || out[k] === '') && prev[k] != null) out[k] = prev[k];
+  }
+  if (out._detailsUnavailable && (prev.renewalDate || prev.renewPriceEGP || prev.routerMonthlyEGP)) {
+    out._detailsUnavailable = `${out._detailsUnavailable} (استخدمت آخر تفاصيل محفوظة)`;
+  }
+  return out;
+}
+
+async function beginRenewFlow(ctx, chatId) {
+  const data = await runFetchWithProgress(ctx, chatId, { forceFetch: true, progressEveryMinutes: 2 }).catch(() => null);
+  if (!data) return;
+  if (data.renewBtnEnabled === false) return ctx.reply('❌ زر Renew غير متاح حالياً.');
+  if (data.canAfford === false) return ctx.reply('❌ الرصيد غير كافي للتجديد.');
+  renewConfirm.set(String(chatId), data);
+  await ctx.reply(
+    `تأكيد التجديد؟
+المبلغ المتوقع: ${to2(data.totalRenewEGP)} EGP
+(${to2(data.renewPriceEGP)} باقة + ${to2(data.routerMonthlyEGP)} راوتر)`,
+    Markup.inlineKeyboard([[Markup.button.callback('✅ Confirm', 'renew:confirm'), Markup.button.callback('❌ Cancel', 'renew:cancel')]])
+  );
+}
+
 async function maybeSaveSnapshot(chatId, data, force = false) {
   await saveSnapshot(chatId, data, { minIntervalMinutes: 5, force }).catch(() => {});
 }
@@ -113,7 +146,7 @@ async function evaluateAlerts(chatId, data = null) {
   const settings = await getReminderSettings(chatId);
   if (!settings.enabled) return;
   const today = await getTodayUsage(chatId);
-  const avg = await getAvgDailyUsage(chatId, 14);
+  const avg = await getAvgDailyStable(chatId);
   const latest = data || await getLatestSnapshot(chatId);
   const month = await getMonthUsage(chatId);
   const day = cairoDay();
@@ -154,14 +187,14 @@ async function runFetchWithProgress(ctx, chatId, opts = {}) {
   if (!forceFetch && st.lastFetchAt && (now - st.lastFetchAt) < 60 * 1000) {
     if (st.cachedData) {
       await ctx.reply('⏱️ طلبت تحديث بسرعة. دي آخر نتيجة، وهعمل تحديث بعد دقيقة.', statusInline());
-      await ctx.reply(formatStatus(st.cachedData, await getTodayUsage(chatId).catch(() => 0), await getAvgDailyUsage(chatId).catch(() => null)), mainKeyboard());
+      await ctx.reply(formatStatus(st.cachedData, await getTodayUsage(chatId).catch(() => 0), await getAvgDailyStable(chatId)), mainKeyboard());
       return st.cachedData;
     }
   }
 
   if (!forceFetch && st.lastFetchAt && st.cachedData && (now - st.lastFetchAt) < 2 * 60 * 1000) {
     await ctx.reply('⚡ رجعتلك آخر Snapshot بسرعة.', statusInline());
-    await ctx.reply(formatStatus(st.cachedData, await getTodayUsage(chatId).catch(() => 0), await getAvgDailyUsage(chatId).catch(() => null)), mainKeyboard());
+    await ctx.reply(formatStatus(st.cachedData, await getTodayUsage(chatId).catch(() => 0), await getAvgDailyStable(chatId)), mainKeyboard());
     return st.cachedData;
   }
 
@@ -183,7 +216,9 @@ async function runFetchWithProgress(ctx, chatId, opts = {}) {
       if (elapsedMin > maxTotalMinutes) throw new Error('TOTAL_TIMEOUT');
 
       try {
-        const data = await fetchWithSession(chatId);
+        const rawData = await fetchWithSession(chatId);
+        const prev = await getLatestSnapshot(chatId).catch(() => null);
+        const data = mergeRenewFieldsIfMissing(rawData, prev);
         await maybeSaveSnapshot(chatId, data, forceSave);
         st.lastFetchAt = Date.now();
         st.cachedData = data;
@@ -191,7 +226,7 @@ async function runFetchWithProgress(ctx, chatId, opts = {}) {
         st.consecutiveFails = 0;
 
         const today = await getTodayUsage(chatId).catch(() => 0);
-        const avg = await getAvgDailyUsage(chatId).catch(() => null);
+        const avg = await getAvgDailyStable(chatId);
         await ctx.reply(formatStatus(data, today, avg), mainKeyboard());
         await evaluateAlerts(chatId, data).catch(() => {});
         return data;
@@ -227,7 +262,7 @@ async function runFetchWithProgress(ctx, chatId, opts = {}) {
 async function sendToday(ctx) {
   const chatId = ctx.chat.id;
   const today = await getTodayUsage(chatId).catch(() => 0);
-  const avg = await getAvgDailyUsage(chatId).catch(() => null);
+  const avg = await getAvgDailyStable(chatId);
   const month = await getMonthUsage(chatId).catch(() => 0);
   await ctx.reply(`📅 استهلاك اليوم: ${to2(today)} GB\n📈 متوسط يومي: ${avg != null ? `${to2(avg)} GB/يوم` : 'غير متاح'}\n📆 استهلاك الشهر: ${to2(month)} GB`, statusInline());
 }
@@ -280,20 +315,7 @@ bot.command('logout', async (ctx) => {
   await ctx.reply('✅ تم تسجيل الخروج.', mainKeyboard());
 });
 
-bot.command('renew', async (ctx) => {
-  const chatId = ctx.chat.id;
-  const data = await runFetchWithProgress(ctx, chatId, { forceFetch: true, progressEveryMinutes: 2 }).catch(() => null);
-  if (!data) return;
-  if (data.renewBtnEnabled === false) return ctx.reply('❌ زر Renew غير متاح حالياً.');
-  if (data.canAfford === false) return ctx.reply('❌ الرصيد غير كافي للتجديد.');
-  renewConfirm.set(String(chatId), data);
-  await ctx.reply(
-    `تأكيد التجديد؟\nالمبلغ المتوقع: ${to2(data.totalRenewEGP)} EGP\n(${to2(data.renewPriceEGP)} باقة + ${to2(data.routerMonthlyEGP)} راوتر)`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Confirm', 'renew:confirm'), Markup.button.callback('❌ Cancel', 'renew:cancel')],
-    ])
-  );
-});
+bot.command('renew', async (ctx) => beginRenewFlow(ctx, ctx.chat.id));
 
 bot.action('renew:confirm', async (ctx) => {
   const chatId = String(ctx.chat.id);
@@ -340,21 +362,21 @@ bot.action(/act:(.+)/, async (ctx) => {
     const data = await getRangeUsage(ctx.chat.id, 7).catch(() => []);
     return ctx.reply(`📈 رسم نصي:\n${textChart(data)}`);
   }
-  if (a === 'renew') return ctx.reply('/renew');
+  if (a === 'renew') return beginRenewFlow(ctx, ctx.chat.id);
   if (a === 'logout') return ctx.reply('/logout');
   return null;
 });
 
-bot.hears('📊 Status', (ctx) => ctx.reply('/status'));
-bot.hears('📅 Today', (ctx) => ctx.reply('/today'));
-bot.hears('📊 Week', (ctx) => ctx.reply('/week'));
-bot.hears('📆 Month', (ctx) => ctx.reply('/month'));
-bot.hears('⚙️ Settings', (ctx) => ctx.reply('/settings'));
-bot.hears('🩺 Diag', (ctx) => ctx.reply('/diag'));
-bot.hears('🔗 Link Account', (ctx) => ctx.reply('/link'));
-bot.hears('♻️ Renew', (ctx) => ctx.reply('/renew'));
-bot.hears('🚪 Logout', (ctx) => ctx.reply('/logout'));
-bot.hears('🧹 Wipe', (ctx) => ctx.reply('/wipe'));
+bot.hears('📊 Status', (ctx) => runFetchWithProgress(ctx, ctx.chat.id, { progressEveryMinutes: 2 }).catch(() => {}));
+bot.hears('📅 Today', (ctx) => sendToday(ctx).catch(() => {}));
+bot.hears('📊 Week', async (ctx) => { const data = await getRangeUsage(ctx.chat.id, 7).catch(() => []); const total = data.reduce((a,b)=>a+b.usage,0); await ctx.reply(`📊 ملخص الأسبوع\n- الإجمالي: ${to2(total)} GB\n${textChart(data)}`, statusInline()); });
+bot.hears('📆 Month', async (ctx) => { const month = await getMonthUsage(ctx.chat.id).catch(() => 0); await ctx.reply(`📆 استهلاك الشهر الحالي: ${to2(month)} GB`, statusInline()); });
+bot.hears('⚙️ Settings', async (ctx) => { const st = await getReminderSettings(ctx.chat.id); await ctx.reply(`⚙️ الإعدادات\n- التنبيهات: ${st.enabled ? 'On' : 'Off'}\n- معامل يومي: x${to2(st.dailyMultiplier)}\n- معامل شهري: x${to2(st.monthlyRatio)}\n\n/settings on|off\n/settings daily 1.5\n/settings monthly 1.2`); });
+bot.hears('🩺 Diag', async (ctx) => { if (!isOwner(ctx.chat.id)) return ctx.reply('⛔ هذا الأمر للمشرف فقط.'); const d = getSessionDiagnostics(ctx.chat.id); const st = getState(ctx.chat.id); await ctx.reply(`🩺 DIAG\n- session file: ${d.hasSessionFile}\n- last fetch: ${d.lastFetchAt || 'n/a'}\n- last error: ${d.lastError || st.lastError || 'none'}\n- current URL: ${d.currentUrl || 'n/a'}\n- method: ${d.methodPicked || 'n/a'}\n- more details visible: ${String(d.moreDetailsVisible)}`); });
+bot.hears('🔗 Link Account', async (ctx) => { linkState.set(ctx.chat.id, { step: 'ASK_SERVICE' }); await ctx.reply('📞 ابعت رقم الخدمة.'); });
+bot.hears('♻️ Renew', (ctx) => beginRenewFlow(ctx, ctx.chat.id));
+bot.hears('🚪 Logout', async (ctx) => { await deleteSession(ctx.chat.id); await ctx.reply('✅ تم تسجيل الخروج.', mainKeyboard()); });
+bot.hears('🧹 Wipe', async (ctx) => { await wipeUserData(ctx.chat.id); await deleteSession(ctx.chat.id).catch(() => {}); fetchState.delete(String(ctx.chat.id)); await ctx.reply('🧹 تم مسح كل بياناتك (DB + session file).', mainKeyboard()); });
 
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
@@ -414,7 +436,7 @@ function startReminderJobs() {
     for (const chatId of chatIds) {
       const latest = await getLatestSnapshot(chatId).catch(() => null);
       const today = await getTodayUsage(chatId).catch(() => 0);
-      const avg = await getAvgDailyUsage(chatId).catch(() => null);
+      const avg = await getAvgDailyStable(chatId);
       if (!latest) continue;
       const quota = calcDailyQuota(latest.remainingGB, latest.remainingDays);
       await bot.telegram.sendMessage(chatId,

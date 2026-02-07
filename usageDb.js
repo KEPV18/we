@@ -158,7 +158,7 @@ async function getTodayUsage(chatId, now = new Date()) {
   return Number(r.maxUsed) || 0;
 }
 
-async function getAvgDailyUsage(chatId, days = 14) {
+async function getAvgDailyUsage(chatId, days = 14, opts = {}) {
   const rows = await dbAll(
     `SELECT day, MIN(usedGB) AS minUsed, MAX(usedGB) AS maxUsed
      FROM snapshots
@@ -166,10 +166,15 @@ async function getAvgDailyUsage(chatId, days = 14) {
      GROUP BY day
      ORDER BY day DESC
      LIMIT ?`,
-    [String(chatId), Number(days)]
+    [String(chatId), Number(days + 2)]
   );
   if (!rows.length) return null;
-  const deltas = rows.map((r) => {
+
+  const excludeToday = opts.excludeToday !== false;
+  const today = cairoDay();
+  const filtered = excludeToday ? rows.filter((r) => r.day !== today) : rows;
+  if (!filtered.length) return null;
+  const deltas = filtered.map((r) => {
     const d = Number(r.maxUsed) - Number(r.minUsed);
     return d >= 0 ? d : Number(r.maxUsed) || 0;
   }).filter((v) => Number.isFinite(v));
@@ -185,7 +190,7 @@ async function getRangeUsage(chatId, days = 7) {
      GROUP BY day
      ORDER BY day DESC
      LIMIT ?`,
-    [String(chatId), Number(days)]
+    [String(chatId), Number(days + 2)]
   );
   return rows.map((r) => {
     const d = Number(r.maxUsed) - Number(r.minUsed);
