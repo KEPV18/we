@@ -1,6 +1,20 @@
 const sqlite3 = require('sqlite3').verbose();
 const db = new sqlite3.Database('./usage.db');
 
+function getCairoDay(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Cairo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+
+  const y = parts.find((p) => p.type === 'year')?.value;
+  const m = parts.find((p) => p.type === 'month')?.value;
+  const d = parts.find((p) => p.type === 'day')?.value;
+  return `${y}-${m}-${d}`;
+}
+
 function safeAlter(sql) {
   return new Promise((resolve) => {
     db.run(sql, () => resolve()); // لو فشل عادي (العمود موجود)
@@ -48,6 +62,15 @@ function initUsageDb() {
       )
     `);
 
+    db.run(`
+      CREATE TABLE IF NOT EXISTS credentials (
+        chatId TEXT PRIMARY KEY,
+        serviceNumber TEXT NOT NULL,
+        password TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+
     // ترقيات لو DB قديمة
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerMonthlyEGP REAL`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
@@ -57,7 +80,7 @@ function initUsageDb() {
 
 function insertSnapshot(chatId, s) {
   return new Promise((resolve, reject) => {
-    const day = s.capturedAt.slice(0, 10);
+    const day = getCairoDay(new Date(s.capturedAt));
 
     db.run(
       `INSERT INTO snapshots(
@@ -115,7 +138,7 @@ function getLastOfDay(chatId, day) {
 }
 
 async function getTodayUsage(chatId, now = new Date()) {
-  const day = now.toISOString().slice(0, 10);
+  const day = getCairoDay(now);
   const [first, last] = await Promise.all([
     getFirstOfDay(chatId, day),
     getLastOfDay(chatId, day),
@@ -126,6 +149,38 @@ async function getTodayUsage(chatId, now = new Date()) {
 
   const delta = Number(last.usedGB) - Number(first.usedGB);
   return delta > 0 ? delta : 0;
+}
+
+async function getLatestBeforeDay(chatId, day) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT * FROM snapshots WHERE chatId=? AND day < ? ORDER BY capturedAt DESC LIMIT 1`,
+      [String(chatId), day],
+      (e, row) => (e ? reject(e) : resolve(row || null))
+    );
+  });
+}
+
+async function getTodayUsageRobust(chatId, now = new Date()) {
+  const day = getCairoDay(now);
+  const [firstToday, lastToday] = await Promise.all([
+    getFirstOfDay(chatId, day),
+    getLastOfDay(chatId, day),
+  ]);
+
+  if (!lastToday || lastToday.usedGB == null) return 0;
+
+  // Standard daily delta if we have more than one point today.
+  if (firstToday && firstToday.usedGB != null) {
+    const d = Number(lastToday.usedGB) - Number(firstToday.usedGB);
+    if (Number.isFinite(d) && d > 0) return d;
+  }
+
+  // Fallback: compare current day last point with latest point from previous days.
+  const prev = await getLatestBeforeDay(chatId, day);
+  if (!prev || prev.usedGB == null) return 0;
+  const delta = Number(lastToday.usedGB) - Number(prev.usedGB);
+  return Number.isFinite(delta) && delta > 0 ? delta : 0;
 }
 
 async function getAvgDailyUsage(chatId, days = 14) {
@@ -182,6 +237,34 @@ function deleteSessionRecord(chatId) {
   });
 }
 
+function saveCredentials(chatId, serviceNumber, password) {
+  return new Promise((resolve, reject) => {
+    const now = new Date().toISOString();
+    db.run(
+      `INSERT INTO credentials(chatId, serviceNumber, password, updatedAt) VALUES(?, ?, ?, ?)
+       ON CONFLICT(chatId) DO UPDATE SET serviceNumber=excluded.serviceNumber, password=excluded.password, updatedAt=excluded.updatedAt`,
+      [String(chatId), String(serviceNumber), String(password), now],
+      (e) => (e ? reject(e) : resolve(true))
+    );
+  });
+}
+
+function getCredentials(chatId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT serviceNumber, password FROM credentials WHERE chatId=?`,
+      [String(chatId)],
+      (e, row) => (e ? reject(e) : resolve(row || null))
+    );
+  });
+}
+
+function deleteCredentials(chatId) {
+  return new Promise((resolve, reject) => {
+    db.run(`DELETE FROM credentials WHERE chatId=?`, [String(chatId)], (e) => (e ? reject(e) : resolve(true)));
+  });
+}
+
 module.exports = {
   initUsageDb,
   insertSnapshot,
@@ -189,8 +272,12 @@ module.exports = {
   getFirstOfDay,
   getLastOfDay,
   getTodayUsage,
+  getTodayUsageRobust,
   getAvgDailyUsage,
   saveSession,
   getSession,
   deleteSessionRecord,
+  saveCredentials,
+  getCredentials,
+  deleteCredentials,
 };

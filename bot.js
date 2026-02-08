@@ -12,16 +12,16 @@ const logger = require('./logger');
 // Core Logic
 const {
   loginAndSave,
-  fetchWithSession,
-  renewWithSession,
+  ensureLoginAndFetch,
   deleteSession,
 } = require('./weSession');
 
 const {
   initUsageDb,
   saveSnapshot,
-  getTodayUsage,
+  getTodayUsageRobust,
   getAvgDailyUsage,
+  saveCredentials,
 } = require('./usageDb');
 
 const { checkRateLimit } = require('./rateLimiter');
@@ -94,7 +94,7 @@ async function handleStatus(ctx) {
   // Rate Limit
   const limit = checkRateLimit(chatId);
   if (!limit.allowed) {
-    return ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
+    return await ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
   }
 
   // Initial Message
@@ -107,37 +107,55 @@ async function handleStatus(ctx) {
     // Try Cache First
     const cachedData = cacheService.get(`status:${chatId}`);
     if (cachedData) {
-      if (msg) ctx.telegram.editMessageText(chatId, msg.message_id, undefined, formatStatus(cachedData.data, cachedData.today, cachedData.avg), { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-      else ctx.reply(formatStatus(cachedData.data, cachedData.today, cachedData.avg), { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+      if (msg) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          msg.message_id,
+          undefined,
+          formatStatus(cachedData.data, cachedData.today, cachedData.avg),
+          { parse_mode: 'Markdown', ...getMainKeyboard(chatId) }
+        );
+      } else {
+        await ctx.reply(
+          formatStatus(cachedData.data, cachedData.today, cachedData.avg),
+          { parse_mode: 'Markdown', ...getMainKeyboard(chatId) }
+        );
+      }
       return;
     }
 
     // Fetch Fresh Data
-    const data = await fetchWithSession(chatId);
+    const data = await ensureLoginAndFetch(chatId);
     await saveSnapshot(chatId, data);
 
     // Check Notifications
     notificationService.checkAndNotify(data, chatId);
 
-    const todayUsage = await getTodayUsage(chatId);
+    const todayUsage = await getTodayUsageRobust(chatId);
     const avgUsage = await getAvgDailyUsage(chatId);
 
     // Update Cache
     cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
 
     const text = formatStatus(data, todayUsage, avgUsage);
-    if (msg) ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-    else ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+    if (msg) {
+      await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, {
+        parse_mode: 'Markdown',
+        ...getMainKeyboard(chatId)
+      });
+    } else {
+      await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+    }
 
   } catch (err) {
-    handleError(ctx, err, 'status');
+    await handleError(ctx, err, 'status');
   }
 }
 
 // ============ Actions & Commands ============
 
-bot.start((ctx) => {
-  ctx.reply(
+bot.start(async (ctx) => {
+  await ctx.reply(
     '👋 أهلاً بيك في بوت WE Usage!\n\nاستخدم القائمة اللي تحت للتحكم في البوت:',
     getMainKeyboard(ctx.chat.id)
   );
@@ -150,7 +168,7 @@ bot.action('refresh_status', async (ctx) => {
 
 bot.action('show_chart', async (ctx) => {
   const chatId = ctx.chat.id;
-  ctx.answerCbQuery('📊 جاري رسم البيانات...');
+  await ctx.answerCbQuery('📊 جاري رسم البيانات...');
 
   try {
     const cached = cacheService.get(`status:${chatId}`);
@@ -167,42 +185,42 @@ bot.action('show_chart', async (ctx) => {
     });
 
   } catch (err) {
-    handleError(ctx, err, 'chart');
+    await handleError(ctx, err, 'chart');
   }
 });
 
 bot.action('show_today', async (ctx) => {
   const chatId = ctx.chat.id;
-  ctx.answerCbQuery();
+  await ctx.answerCbQuery();
 
   try {
-    const today = await getTodayUsage(chatId);
-    ctx.reply(`📅 استهلاكك النهاردة: *${to2(today)} GB*`, { parse_mode: 'Markdown' });
+    const today = await getTodayUsageRobust(chatId);
+    await ctx.reply(`📅 استهلاكك النهاردة: *${to2(today)} GB*`, { parse_mode: 'Markdown' });
   } catch (err) {
-    handleError(ctx, err, 'today');
+    await handleError(ctx, err, 'today');
   }
 });
 
-bot.action('renew_quota', (ctx) => {
-  ctx.answerCbQuery();
-  ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
+bot.action('renew_quota', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
 });
 
-bot.action('link_account', (ctx) => {
+bot.action('link_account', async (ctx) => {
   userState.set(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
-  ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
+  await ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
 });
 
-bot.action('logout', (ctx) => {
+bot.action('logout', async (ctx) => {
   const chatId = ctx.chat.id;
-  deleteSession(chatId);
+  await deleteSession(chatId);
   cacheService.del(`status:${chatId}`);
-  ctx.answerCbQuery('تم الخروج');
-  ctx.editMessageText('✅ تم تسجيل الخروج بنجاح.', getMainKeyboard(chatId));
+  await ctx.answerCbQuery('تم الخروج');
+  await ctx.editMessageText('✅ تم تسجيل الخروج بنجاح.', getMainKeyboard(chatId));
 });
 
 bot.command('status', handleStatus);
-bot.command('link', (ctx) => ctx.reply('📞 ابعت رقم الخدمة (Service Number):'));
+bot.command('link', async (ctx) => ctx.reply('📞 ابعت رقم الخدمة (Service Number):'));
 
 // Linking Wizard Logic
 bot.on('text', async (ctx) => {
@@ -215,11 +233,11 @@ bot.on('text', async (ctx) => {
   try {
     if (state.stage === 'AWAITING_SERVICE_NUMBER') {
       if (!/^\d+$/.test(text) || text.length < 7) {
-        return ctx.reply('⚠️ رقم الخدمة لازم يكون أرقام بس وطوله مناسب. جرب تاني:');
+        return await ctx.reply('⚠️ رقم الخدمة لازم يكون أرقام بس وطوله مناسب. جرب تاني:');
       }
       state.serviceNumber = text;
       state.stage = 'AWAITING_PASSWORD';
-      ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
+      await ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
     }
     else if (state.stage === 'AWAITING_PASSWORD') {
       const password = text;
@@ -229,16 +247,17 @@ bot.on('text', async (ctx) => {
 
       try {
         await loginAndSave(chatId, state.serviceNumber, password);
-        ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, '✅ تم ربط الحساب بنجاح! هجيبلك بياناتك دلوقتي...');
+        await saveCredentials(chatId, state.serviceNumber, password);
+        await ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, '✅ تم ربط الحساب بنجاح! هجيبلك بياناتك دلوقتي...');
 
         // Auto-fetch status after link
-        handleStatus(ctx);
+        await handleStatus(ctx);
       } catch (err) {
-        ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, `❌ فشل ربط الحساب: ${err.message}\n\nتأكد من الرقم والباسورد وجرب تاني باستخدام /link`);
+        await ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, `❌ فشل ربط الحساب: ${err.message}\n\nتأكد من الرقم والباسورد وجرب تاني باستخدام /link`);
       }
     }
   } catch (err) {
-    handleError(ctx, err, 'linking_wizard');
+    await handleError(ctx, err, 'linking_wizard');
   }
 });
 

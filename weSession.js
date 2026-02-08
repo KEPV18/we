@@ -8,13 +8,11 @@ const userPool = new Map(); // chatId -> { context, page, diagnostics }
 let sharedBrowser = null;
 
 const {
-  initUsageDb,
-  saveSnapshot,
-  getTodayUsage,
-  getAvgDailyUsage,
   saveSession,
   getSession,
   deleteSessionRecord,
+  getCredentials,
+  deleteCredentials,
 } = require('./usageDb');
 const logger = require('./logger');
 
@@ -391,6 +389,23 @@ async function fetchWithSession(chatId) {
   }
 }
 
+async function ensureLoginAndFetch(chatId) {
+  try {
+    return await fetchWithSession(chatId);
+  } catch (err) {
+    const msg = String(err?.message || err || '');
+    if (!msg.includes('SESSION_EXPIRED') && !msg.includes('NO_SESSION')) throw err;
+
+    const creds = await getCredentials(chatId);
+    if (!creds?.serviceNumber || !creds?.password) {
+      throw err;
+    }
+
+    await loginAndSave(chatId, creds.serviceNumber, creds.password);
+    return fetchWithSession(chatId);
+  }
+}
+
 async function renewWithSession(chatId) {
   try {
     const page = await gotoOverview(chatId);
@@ -430,6 +445,7 @@ async function deleteSession(chatId) {
 
   // 🔥 3. Delete from DB
   await deleteSessionRecord(chatId).catch(() => { });
+  await deleteCredentials(chatId).catch(() => { });
   debugLog(`Session for ${chatId} deleted from DB.`);
   return true;
 }
@@ -437,6 +453,7 @@ async function deleteSession(chatId) {
 module.exports = {
   loginAndSave,
   fetchWithSession,
+  ensureLoginAndFetch,
   renewWithSession,
   deleteSession,
   getSessionDiagnostics,
