@@ -1,5 +1,6 @@
 require('dotenv').config();
 const cron = require('node-cron');
+const http = require('http');
 const { Telegraf, Markup } = require('telegraf');
 const { logger } = require('./logger');
 const {
@@ -36,6 +37,48 @@ const BACKOFF_MINUTES = [1, 3, 5, 10, 20, 30, 60];
 const linkState = new Map();
 const fetchState = new Map(); // chatId -> { lastFetchAt, cachedData, consecutiveFails, pending }
 const renewConfirm = new Map(); // chatId -> data
+
+
+let healthServer = null;
+let botReady = false;
+
+function startHealthServer() {
+  const port = Number(process.env.PORT || 10000);
+  healthServer = http.createServer((req, res) => {
+    if (req.url === '/healthz') {
+      res.writeHead(botReady ? 200 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: botReady, service: 'we-usage-bot' }));
+      return;
+    }
+    if (req.url === '/' || req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('we-usage-bot alive');
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('not found');
+  });
+
+  healthServer.listen(port, '0.0.0.0', () => {
+    logger.info('health_server_started', { port });
+    console.log(`Health server listening on :${port}`);
+  });
+}
+
+async function shutdownGracefully(signal = 'SIGTERM') {
+  try {
+    logger.info('shutdown_start', { signal });
+    await bot.stop(signal);
+  } catch (err) {
+    logger.error('shutdown_bot_stop_failed', { error: describeError(err) });
+  }
+
+  if (healthServer) {
+    await new Promise((resolve) => healthServer.close(() => resolve()));
+  }
+  process.exit(0);
+}
+
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function to2(n) { return (n == null || Number.isNaN(n)) ? 'غير متاح' : Number(n).toFixed(2); }
@@ -455,6 +498,7 @@ async function launchBotWithRetry() {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       await bot.launch();
+      botReady = true;
       startReminderJobs();
       console.log('Bot running...');
       return true;
@@ -469,6 +513,9 @@ async function launchBotWithRetry() {
 }
 
 if (require.main === module) {
+  startHealthServer();
+  process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+  process.on('SIGINT', () => shutdownGracefully('SIGINT'));
   launchBotWithRetry().catch((err) => console.error('Fatal launch error:', describeError(err)));
 }
 

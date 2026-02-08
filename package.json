@@ -2,9 +2,11 @@
   "name": "we-usage-bot",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js",
+    "render-build": "npm ci && npx playwright install chromium",
+    "test": "echo \"No tests configured\""
   },
   "keywords": [],
   "author": "",

@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: we-usage-bot
+    env: node
+    plan: free
+    buildCommand: npm ci && npx playwright install chromium
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
