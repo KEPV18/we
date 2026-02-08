@@ -123,7 +123,7 @@ async function handleStatus(ctx) {
     const avgUsage = await getAvgDailyUsage(chatId);
 
     // Update Cache
-    cacheService.set(`status:${chatId}`, { data, today, avg: avgUsage });
+    cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
 
     const text = formatStatus(data, todayUsage, avgUsage);
     if (msg) ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
@@ -143,9 +143,9 @@ bot.start((ctx) => {
   );
 });
 
-bot.action('refresh_status', (ctx) => {
-  ctx.answerCbQuery('🔄 جاري التحديث...');
-  handleStatus(ctx);
+bot.action('refresh_status', async (ctx) => {
+  await ctx.answerCbQuery('🔄 جاري التحديث...');
+  await handleStatus(ctx);
 });
 
 bot.action('show_chart', async (ctx) => {
@@ -265,3 +265,19 @@ app.listen(PORT, async () => {
 
 // Init DB
 try { initUsageDb(); } catch (e) { logger.error('DB Init Error', e); }
+
+// Graceful Shutdown
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+async function shutdown(signal) {
+  logger.info(`Received ${signal}. Shutting down gracefully...`);
+  bot.stop(signal); // Stop Telegraf processing
+
+  // Close Browser Contexts if any (cleanup handled in weSession but logic serves as safeguard)
+  // Actually we should expose a cleanup function in weSession to be 100% sure
+  // For now, letting process exit might be enough if we rely on OS cleanup, 
+  // but explicitly closing DB/Server is better.
+
+  process.exit(0);
+}

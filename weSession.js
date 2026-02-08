@@ -16,6 +16,7 @@ const {
   getSession,
   deleteSessionRecord,
 } = require('./usageDb');
+const logger = require('./logger');
 
 function debugLog(...args) { if (DEBUG) console.log('[WE-DEBUG]', ...args); }
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
