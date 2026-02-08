@@ -166,7 +166,7 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
       return gotoOverview(chatId, { retryOnce: false });
     }
     if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'SESSION_EXPIRED') }).catch(() => { });
-    throw new Error('SESSION_EXPIRED');
+    throw new Error(`SESSION_EXPIRED (Redirected to: ${url2})`);
   }
 
   return page;
@@ -283,7 +283,8 @@ async function extractBasics(page) {
     const count = await titles.count().catch(() => 0);
     for (let i = 0; i < Math.min(count, 60); i += 1) {
       const t = await titles.nth(i).getAttribute('title').catch(() => null);
-      if (t && (/GB/i.test(t) || /speed/i.test(t))) return t.trim();
+      // Relaxed regex to include more plan variations
+      if (t && t.length > 3 && t.length < 50 && !t.includes('Details') && !t.includes('More')) return t.trim();
     }
     return '';
   })();

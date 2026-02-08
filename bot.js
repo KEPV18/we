@@ -59,6 +59,10 @@ function formatStatus(data, todayUsage, avgUsage) {
   const remainingDays = data.remainingDays ?? '؟';
   const usedPercent = data.totalGB ? Math.round((data.usedGB / data.totalGB) * 100) : '?';
 
+  // Handle todayUsage object or number (backward compatibility)
+  const todayVal = typeof todayUsage === 'object' ? todayUsage.usage : todayUsage;
+  const todaySince = typeof todayUsage === 'object' && todayUsage.since ? ` (منذ ${todayUsage.since})` : '';
+
   return [
     `📶 *WE Home Internet*`,
     `➖➖➖➖➖➖➖➖➖➖`,
@@ -66,7 +70,7 @@ function formatStatus(data, todayUsage, avgUsage) {
     `📉 *المتبقي:* ${to2(data.remainingGB)} GB`,
     `📈 *المستخدم:* ${to2(data.usedGB)} GB (${usedPercent}%)`,
     `📅 *التجديد:* ${data.renewalDate || 'غير متاح'} (باقي ${remainingDays} يوم)`,
-    `🗓 *استهلاك اليوم:* ${to2(todayUsage)} GB`,
+    `🗓 *استهلاك اليوم:* ${to2(todayVal)} GB${todaySince}`,
     `📊 *متوسط يومي:* ${avgUsage ? to2(avgUsage) : 'غير متاح'} GB`,
     `➖➖➖➖➖➖➖➖➖➖`,
     `💰 *الرصيد:* ${to2(data.balanceEGP)} EGP`,
@@ -135,7 +139,12 @@ async function handleStatus(ctx) {
     else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
 
   } catch (err) {
-    if (err.message.includes('SESSION_EXPIRED')) {
+    // 🔥 Improved Error Handling for Auto-Login
+    const msg = String(err?.message || err || '');
+    const isSessionError = msg.includes('SESSION_EXPIRED') || msg.includes('BROWSER_CLOSED') || msg.includes('Target closed') || msg.includes('Navigation failed');
+
+    if (isSessionError) {
+      logger.warn(`Session issue detected for ${chatId}: ${msg}. Attempting auto-login...`);
       const creds = await getCredentials(chatId);
       if (creds) {
         try {
@@ -212,12 +221,9 @@ bot.action('show_today', async (ctx) => {
   await ctx.answerCbQuery();
 
   try {
-    const today = await getTodayUsage(chatId);
-    await ctx.reply(`📅 استهلاكك النهاردة: *${to2(today)} GB*`, { parse_mode: 'Markdown' });
-  } catch (err) {
     await handleError(ctx, err, 'today');
   }
-});
+  });
 
 bot.action('renew_quota', async (ctx) => {
   await ctx.answerCbQuery();

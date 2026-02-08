@@ -140,11 +140,17 @@ async function getTodayUsage(chatId, now = new Date()) {
     getLastOfDay(chatId, day),
   ]);
 
-  if (!first || !last) return 0;
-  if (first.usedGB == null || last.usedGB == null) return 0;
+  if (!first || !last) return { usage: 0, since: null };
+  if (first.usedGB == null || last.usedGB == null) return { usage: 0, since: null };
 
   const delta = Number(last.usedGB) - Number(first.usedGB);
-  return delta > 0 ? delta : 0;
+  const usage = delta > 0 ? delta : 0;
+
+  // Format "since" time (e.g., "3:30 PM")
+  const sinceDate = new Date(first.capturedAt);
+  const since = sinceDate.toLocaleTimeString('ar-EG', { hour: 'numeric', minute: '2-digit' });
+
+  return { usage, since };
 }
 
 async function getAvgDailyUsage(chatId, days = 14) {
