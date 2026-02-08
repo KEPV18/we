@@ -15,42 +15,41 @@ class CronService {
   init() {
     // Example: Update active users every hour
     // '0 * * * *' = every hour at minute 0
-    // logger.info('Hourly update completed');
-  } catch(err) {
-    logger.error('Error in hourly update job:', err);
-  }
-});
-
-logger.info('Cron jobs scheduled');
-}
-
-/**
- * Schedule a new job
- * @param {string} expression Cron expression
- * @param {Function} task Task to run
- */
-schedule(expression, task) {
-  if (!cron.validate(expression)) {
-    logger.error(`Invalid cron expression: ${expression}`);
-    return;
+    /*
+    this.schedule('0 * * * *', async () => {
+      logger.info('Running hourly update job...');
+    });
+    */
+    logger.info('Cron jobs init completed (no active jobs)');
   }
 
-  const job = cron.schedule(expression, task, {
-    scheduled: true,
-    timezone: "Africa/Cairo"
-  });
+  /**
+   * Schedule a new job
+   * @param {string} expression Cron expression
+   * @param {Function} task Task to run
+   */
+  schedule(expression, task) {
+    if (!cron.validate(expression)) {
+      logger.error(`Invalid cron expression: ${expression}`);
+      return;
+    }
 
-  this.jobs.push(job);
-  logger.info(`Job scheduled: ${expression}`);
-}
+    const job = cron.schedule(expression, task, {
+      scheduled: true,
+      timezone: "Africa/Cairo"
+    });
 
-/**
- * Stop all jobs
- */
-stopAll() {
-  this.jobs.forEach(job => job.stop());
-  logger.info('All cron jobs stopped');
-}
+    this.jobs.push(job);
+    logger.info(`Job scheduled: ${expression}`);
+  }
+
+  /**
+   * Stop all jobs
+   */
+  stopAll() {
+    this.jobs.forEach(job => job.stop());
+    logger.info('All cron jobs stopped');
+  }
 }
 
 module.exports = new CronService();
