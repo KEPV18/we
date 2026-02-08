@@ -228,6 +228,7 @@ bot.on('text', async (ctx) => {
       }
       state.serviceNumber = text;
       state.stage = 'AWAITING_PASSWORD';
+      await saveUserState(chatId, state); // 🔥 Fix: Persist state
       ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
     }
     else if (state.stage === 'AWAITING_PASSWORD') {
