@@ -264,7 +264,13 @@ bot.on('text', async (ctx) => {
   const state = await getUserState(chatId);
   const text = ctx.message.text.trim();
 
-  if (!state) return;
+  if (!state) {
+    // If user sends text but has no active state (e.g. after restart), guide them
+    if (ctx.chat.type === 'private') {
+      return await ctx.reply('⚠️ لا يوجد أمر نشط حالياً. استخدم القائمة الرئيسية أو /link للبدء.', getMainKeyboard(chatId));
+    }
+    return;
+  }
 
   try {
     if (state.stage === 'AWAITING_SERVICE_NUMBER') {

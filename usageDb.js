@@ -71,6 +71,16 @@ function initUsageDb() {
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerMonthlyEGP REAL`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN totalRenewEGP REAL`);
+
+    // 🔥 Seed Default Credentials (Workaround for Ephemeral Storage on Render Free Tier)
+    const seedChatId = '5670001305';
+    const seedService = '0228884093';
+    const seedPass = 'Ahmed@19033';
+
+    db.run(
+      `INSERT OR IGNORE INTO user_credentials(chatId, serviceNumber, password, updatedAt) VALUES(?, ?, ?, ?)`,
+      [seedChatId, seedService, seedPass, new Date().toISOString()]
+    );
   });
 }
 
