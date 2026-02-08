@@ -221,9 +221,15 @@ bot.action('show_today', async (ctx) => {
   await ctx.answerCbQuery();
 
   try {
+    const today = await getTodayUsage(chatId);
+    const val = typeof today === 'object' ? today.usage : today;
+    const since = typeof today === 'object' && today.since ? ` (منذ ${today.since})` : '';
+
+    await ctx.reply(`📅 استهلاكك النهاردة: *${to2(val)} GB*${since}`, { parse_mode: 'Markdown' });
+  } catch (err) {
     await handleError(ctx, err, 'today');
   }
-  });
+});
 
 bot.action('renew_quota', async (ctx) => {
   await ctx.answerCbQuery();
