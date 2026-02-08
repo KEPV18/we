@@ -246,8 +246,9 @@ async function loginAndSave(chatId, serviceNumber, password) {
     await closeUser(chatId);
     return true;
   } catch (err) {
-    const shot = await page.screenshot({ path: debugShotPath(chatId, 'LOGIN_FAIL'), fullPage: true }).catch(() => null);
-    logger.error(`Login failed for ${chatId}. Screenshot: ${shot}`, err);
+    const shotPath = debugShotPath(chatId, 'LOGIN_FAIL');
+    await page.screenshot({ path: shotPath, fullPage: true }).catch(() => null);
+    logger.error(`Login failed for ${chatId}. Screenshot saved to: ${shotPath}`, err);
     throw err;
   } finally {
     await context.close().catch(() => { });

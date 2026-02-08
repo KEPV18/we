@@ -57,6 +57,16 @@ function initUsageDb() {
       )
     `);
 
+    // 🔥 New User Credentials Table for Auto-Login
+    db.run(`
+      CREATE TABLE IF NOT EXISTS user_credentials (
+        chatId TEXT PRIMARY KEY,
+        serviceNumber TEXT NOT NULL,
+        password TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+
     // ترقيات لو DB قديمة
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerMonthlyEGP REAL`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
@@ -220,6 +230,29 @@ function deleteUserState(chatId) {
   });
 }
 
+// 🔥 Credential Management Functions
+function saveCredentials(chatId, serviceNumber, password) {
+  return new Promise((resolve, reject) => {
+    const now = new Date().toISOString();
+    db.run(
+      `INSERT INTO user_credentials(chatId, serviceNumber, password, updatedAt) VALUES(?, ?, ?, ?)
+       ON CONFLICT(chatId) DO UPDATE SET serviceNumber=excluded.serviceNumber, password=excluded.password, updatedAt=excluded.updatedAt`,
+      [String(chatId), String(serviceNumber), String(password), now],
+      (e) => (e ? reject(e) : resolve(true))
+    );
+  });
+}
+
+function getCredentials(chatId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT serviceNumber, password FROM user_credentials WHERE chatId=?`,
+      [String(chatId)],
+      (e, row) => (e ? reject(e) : resolve(row || null))
+    );
+  });
+}
+
 module.exports = {
   initUsageDb,
   insertSnapshot,
@@ -234,4 +267,6 @@ module.exports = {
   saveUserState,
   getUserState,
   deleteUserState,
+  saveCredentials,
+  getCredentials,
 };

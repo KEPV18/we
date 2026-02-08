@@ -25,6 +25,8 @@ const {
   saveUserState,
   getUserState,
   deleteUserState,
+  saveCredentials,
+  getCredentials,
 } = require('./usageDb');
 
 const { checkRateLimit } = require('./rateLimiter');
@@ -97,7 +99,7 @@ async function handleStatus(ctx) {
   // Rate Limit
   const limit = checkRateLimit(chatId);
   if (!limit.allowed) {
-    return ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
+    return await ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
   }
 
   // Initial Message
@@ -133,7 +135,38 @@ async function handleStatus(ctx) {
     else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
 
   } catch (err) {
-    handleError(ctx, err, 'status');
+    if (err.message.includes('SESSION_EXPIRED')) {
+      const creds = await getCredentials(chatId);
+      if (creds) {
+        try {
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '⏳ الجلسة انتهت، جاري إعادة الدخول تلقائياً...', { parse_mode: 'Markdown' });
+          else msg = await ctx.reply('⏳ الجلسة انتهت، جاري إعادة الدخول تلقائياً...', { parse_mode: 'Markdown' });
+
+          await loginAndSave(chatId, creds.serviceNumber, creds.password);
+
+          // Retry fetch
+          const data = await fetchWithSession(chatId);
+          await saveSnapshot(chatId, data);
+          notificationService.checkAndNotify(data, chatId);
+          const todayUsage = await getTodayUsage(chatId);
+          const avgUsage = await getAvgDailyUsage(chatId);
+          cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
+          const text = formatStatus(data, todayUsage, avgUsage);
+
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+          else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+          return;
+        } catch (loginErr) {
+          logger.error(`Auto-login failed for ${chatId}`, loginErr);
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '❌ فشل الدخول التلقائي. من فضلك اربط الحساب تاني.', { parse_mode: 'Markdown' });
+          else await ctx.reply('❌ فشل الدخول التلقائي. من فضلك اربط الحساب تاني.', { parse_mode: 'Markdown' });
+        }
+      } else {
+        await handleError(ctx, err, 'status');
+      }
+    } else {
+      await handleError(ctx, err, 'status');
+    }
   }
 }
 
@@ -153,12 +186,12 @@ bot.action('refresh_status', async (ctx) => {
 
 bot.action('show_chart', async (ctx) => {
   const chatId = ctx.chat.id;
-  ctx.answerCbQuery('📊 جاري رسم البيانات...');
+  await ctx.answerCbQuery('📊 جاري رسم البيانات...');
 
   try {
     const cached = cacheService.get(`status:${chatId}`);
     if (!cached) {
-      return ctx.reply('⚠️ لازم تعمل "تحديث الآن" الأول عشان البيانات تظهر.');
+      return await ctx.reply('⚠️ لازم تعمل "تحديث الآن" الأول عشان البيانات تظهر.');
     }
 
     // Generate Chart
@@ -170,7 +203,7 @@ bot.action('show_chart', async (ctx) => {
     });
 
   } catch (err) {
-    handleError(ctx, err, 'chart');
+    await handleError(ctx, err, 'chart');
   }
 });
 
@@ -182,7 +215,7 @@ bot.action('show_today', async (ctx) => {
     const today = await getTodayUsage(chatId);
     await ctx.reply(`📅 استهلاكك النهاردة: *${to2(today)} GB*`, { parse_mode: 'Markdown' });
   } catch (err) {
-    handleError(ctx, err, 'today');
+    await handleError(ctx, err, 'today');
   }
 });
 
@@ -224,12 +257,12 @@ bot.on('text', async (ctx) => {
   try {
     if (state.stage === 'AWAITING_SERVICE_NUMBER') {
       if (!/^\d+$/.test(text) || text.length < 7) {
-        return ctx.reply('⚠️ رقم الخدمة لازم يكون أرقام بس وطوله مناسب. جرب تاني:');
+        return await ctx.reply('⚠️ رقم الخدمة لازم يكون أرقام بس وطوله مناسب. جرب تاني:');
       }
       state.serviceNumber = text;
       state.stage = 'AWAITING_PASSWORD';
       await saveUserState(chatId, state); // 🔥 Fix: Persist state
-      ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
+      await ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
     }
     else if (state.stage === 'AWAITING_PASSWORD') {
       const password = text;
@@ -239,16 +272,17 @@ bot.on('text', async (ctx) => {
 
       try {
         await loginAndSave(chatId, state.serviceNumber, password);
-        ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, '✅ تم ربط الحساب بنجاح! هجيبلك بياناتك دلوقتي...');
+        await saveCredentials(chatId, state.serviceNumber, password); // 🔥 Save credentials for auto-login
+        await ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, '✅ تم ربط الحساب بنجاح! هجيبلك بياناتك دلوقتي...');
 
         // Auto-fetch status after link
-        handleStatus(ctx);
+        await handleStatus(ctx);
       } catch (err) {
-        ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, `❌ فشل ربط الحساب: ${err.message}\n\nتأكد من الرقم والباسورد وجرب تاني باستخدام /link`);
+        await ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, `❌ فشل ربط الحساب: ${err.message}\n\nتأكد من الرقم والباسورد وجرب تاني باستخدام /link`);
       }
     }
   } catch (err) {
-    handleError(ctx, err, 'linking_wizard');
+    await handleError(ctx, err, 'linking_wizard');
   }
 });
 
@@ -261,7 +295,7 @@ app.get('/', (req, res) => res.json({ status: 'OK', uptime: process.uptime() }))
 app.use(bot.webhookCallback('/telegram'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   logger.info(`Server running on port ${PORT}`);
 
   const domain = process.env.RENDER_EXTERNAL_URL;
@@ -277,27 +311,31 @@ app.listen(PORT, async () => {
 try { initUsageDb(); } catch (e) { logger.error('DB Init Error', e); }
 
 // Graceful Shutdown
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
-
-async function shutdown(signal) {
-  logger.info(`Received ${signal}. Shutting down gracefully...`);
-  bot.stop(signal); // Stop Telegraf processing
-  process.exit(0);
-}
-
 // Graceful Shutdown
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 async function shutdown(signal) {
   logger.info(`Received ${signal}. Shutting down gracefully...`);
-  bot.stop(signal); // Stop Telegraf processing
 
-  // Close Browser Contexts if any (cleanup handled in weSession but logic serves as safeguard)
-  // Actually we should expose a cleanup function in weSession to be 100% sure
-  // For now, letting process exit might be enough if we rely on OS cleanup, 
-  // but explicitly closing DB/Server is better.
+  // 1. Stop Telegram Bot
+  bot.stop(signal);
 
+  // 2. Stop Cron Jobs
+  cronService.stopAll();
+
+  // 3. Close Server
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+    logger.info('HTTP server closed');
+  }
+
+  // 4. Close Database
+  // usageDb.close(); // If exposed
+
+  // 5. Close Playwright Browsers (via weSession if exposed, or rely on process exit)
+  // await weSession.closeAll(); // TODO: Implement if needed
+
+  logger.info('Graceful shutdown completed');
   process.exit(0);
 }
