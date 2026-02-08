@@ -233,7 +233,7 @@ bot.on('text', async (ctx) => {
     }
     else if (state.stage === 'AWAITING_PASSWORD') {
       const password = text;
-      userState.delete(chatId); // Clear state
+      await deleteUserState(chatId); // Clear state from DB
 
       const loadingMsg = await ctx.reply('⏳ جاري تسجيل الدخول وحفظ الجلسة في قاعدة البيانات...', { parse_mode: 'Markdown' });
 
