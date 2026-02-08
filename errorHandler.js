@@ -1,5 +1,5 @@
 // Error Handler موحد للبوت
-const logger = require('./logger');
+const { logger } = require('./logger');
 
 class BotError extends Error {
     constructor(code, message, originalError = null) {
