@@ -1,0 +1,49 @@
+# .gitignore
+# للملفات التي لا يجب رفعها على Git
+
+# Secrets والمتغيرات البيئية
+.env
+.env.local
+.env.*.local
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+usage.db
+
+# Session files
+sessions/
+*.json
+
+# Logs
+logs/
+*.log
+
+# Operating System
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build
+dist/
+build/
+.cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
