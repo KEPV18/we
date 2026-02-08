@@ -67,8 +67,8 @@ function getUserEntry(chatId) {
 
 async function closeUser(chatId) {
   const entry = getUserEntry(chatId);
-  if (entry.page) await entry.page.close().catch(() => {});
-  if (entry.context) await entry.context.close().catch(() => {});
+  if (entry.page) await entry.page.close().catch(() => { });
+  if (entry.context) await entry.context.close().catch(() => { });
   entry.page = null;
   entry.context = null;
 }
@@ -88,7 +88,7 @@ async function ensurePage(chatId, forceNew = false) {
   const entry = getUserEntry(chatId);
   const context = await ensureContext(chatId, forceNew);
   if (forceNew && entry.page) {
-    await entry.page.close().catch(() => {});
+    await entry.page.close().catch(() => { });
     entry.page = null;
   }
   if (entry.page && !entry.page.isClosed()) return entry.page;
@@ -120,12 +120,12 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
   let page = await ensurePage(chatId);
   try {
     await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' });
-    await waitOverviewHealth(page).catch(() => {});
+    await waitOverviewHealth(page).catch(() => { });
   } catch (err) {
     if (isClosedContextError(err)) {
       page = await ensurePage(chatId, true);
       await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' });
-      await waitOverviewHealth(page).catch(() => {});
+      await waitOverviewHealth(page).catch(() => { });
     } else {
       throw err;
     }
@@ -134,8 +134,8 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
   const currentUrl = page.url();
   entry.diagnostics.currentUrl = currentUrl;
   if (currentUrl.includes('/signin') || currentUrl.includes('#/home/signin')) {
-    await page.waitForTimeout(1500).catch(() => {});
-    await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(1500).catch(() => { });
+    await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' }).catch(() => { });
     const url2 = page.url();
     entry.diagnostics.currentUrl = url2;
     if (!(url2.includes('/signin') || url2.includes('#/home/signin'))) return page;
@@ -144,7 +144,7 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
       await ensureContext(chatId, true);
       return gotoOverview(chatId, { retryOnce: false });
     }
-    if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'SESSION_EXPIRED') }).catch(() => {});
+    if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'SESSION_EXPIRED') }).catch(() => { });
     throw new Error('SESSION_EXPIRED');
   }
 
@@ -153,28 +153,75 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
 
 async function loginAndSave(chatId, serviceNumber, password) {
   const browser = await getBrowser();
-  const context = await browser.newContext();
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 720 }
+  });
   const page = await context.newPage();
-  page.setDefaultTimeout(120000);
-  page.setDefaultNavigationTimeout(120000);
+
+  // High timeouts for slow WE site
+  const LONG_TIMEOUT = 120000;
+  page.setDefaultTimeout(LONG_TIMEOUT);
+  page.setDefaultNavigationTimeout(LONG_TIMEOUT);
 
   try {
-    await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded' });
+    debugLog(`Starting login for ${chatId}`);
+    await page.goto(SEL.signinUrl, { waitUntil: 'networkidle', timeout: LONG_TIMEOUT });
+
+    // Wait for the form to be ready
+    await page.waitForSelector(SEL.inputService, { state: 'visible' });
+
+    // Type Service Number
     await page.click(SEL.inputService);
-    await page.keyboard.type(String(serviceNumber), { delay: 30 });
-    await page.locator(SEL.selectServiceTypeTrigger).first().click();
-    await page.locator(SEL.selectServiceTypeInternet, { hasText: 'Internet' }).click();
+    await page.keyboard.type(String(serviceNumber), { delay: 50 });
+
+    // Select Service Type (Internet)
+    debugLog('Selecting service type...');
+    const selectorTrigger = page.locator(SEL.selectServiceTypeTrigger).first();
+    await selectorTrigger.waitFor({ state: 'visible' });
+    await selectorTrigger.click({ force: true });
+
+    // Wait for dropdown and pick 'Internet'
+    await page.waitForTimeout(1000);
+    const internetOption = page.locator(SEL.selectServiceTypeInternet).filter({ hasText: /Internet/i }).first();
+    await internetOption.waitFor({ state: 'visible' });
+    await internetOption.click();
+
+    // Type Password
+    await page.waitForSelector(SEL.inputPassword, { state: 'visible' });
     await page.click(SEL.inputPassword);
-    await page.keyboard.type(String(password), { delay: 30 });
+    await page.keyboard.type(String(password), { delay: 50 });
+
+    // Click Login
     const loginBtn = page.locator(SEL.loginButton);
     await loginBtn.waitFor({ state: 'visible' });
-    await loginBtn.click({ force: true });
-    await page.waitForTimeout(4000);
+
+    debugLog('Clicking login button...');
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => { }),
+      loginBtn.click({ force: true })
+    ]);
+
+    // Check if successful (URL change or specific element)
+    await page.waitForTimeout(5000);
+    const url = page.url();
+    debugLog(`Final URL after login: ${url}`);
+
+    if (url.includes('/signin') || url.includes('login')) {
+      // Check for error messages on page
+      const errorMsg = await page.locator('.ant-message-notice, .error-message').innerText().catch(() => '');
+      if (errorMsg) throw new Error(`WE_SITE_ERROR: ${errorMsg}`);
+      throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
+    }
+
     await context.storageState({ path: statePath(chatId) });
     await closeUser(chatId);
     return true;
+  } catch (err) {
+    const shot = await page.screenshot({ path: debugShotPath(chatId, 'LOGIN_FAIL'), fullPage: true }).catch(() => null);
+    logger.error(`Login failed for ${chatId}. Screenshot: ${shot}`, err);
+    throw err;
   } finally {
-    await context.close().catch(() => {});
+    await context.close().catch(() => { });
   }
 }
 
@@ -183,20 +230,20 @@ async function openMoreDetailsResilient(page, chatId) {
   for (let i = 0; i < 6; i += 1) {
     const visible = await more.isVisible().catch(() => false);
     if (visible) {
-      await more.scrollIntoViewIfNeeded().catch(() => {});
-      await more.click({ force: true }).catch(() => {});
+      await more.scrollIntoViewIfNeeded().catch(() => { });
+      await more.click({ force: true }).catch(() => { });
       await page.waitForTimeout(1600);
       const marker = await page.locator('text=/Renewal|Unsubscribe|Router|Renew/i').first().isVisible().catch(() => false);
       if (marker) return { ok: true };
     }
-    await page.mouse.wheel(0, 900).catch(() => {});
+    await page.mouse.wheel(0, 900).catch(() => { });
     await page.waitForTimeout(2000);
   }
 
   const bodyText = await page.locator('body').innerText().catch(() => '');
   if (/Renewal\s*Date:/i.test(bodyText)) return { ok: true, fallback: true };
 
-  if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'MORE_FAIL') }).catch(() => {});
+  if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'MORE_FAIL') }).catch(() => { });
   return { ok: false, reason: 'MORE_NOT_VISIBLE' };
 }
 
@@ -256,6 +303,21 @@ async function fetchWithSession(chatId) {
   try {
     page = await gotoOverview(chatId);
     const basics = await extractBasics(page);
+
+    // FIX: If basics extraction totally failed (all nulls), page might be broken or session invalid
+    if (basics.remainingGB === null && basics.usedGB === null) {
+      // Try one reload
+      debugLog('Basics null, reloading page once...');
+      await page.reload({ waitUntil: 'networkidle' });
+      await page.waitForTimeout(3000);
+      const basicsRetry = await extractBasics(page);
+      if (basicsRetry.remainingGB !== null) {
+        Object.assign(basics, basicsRetry);
+      } else {
+        // Still null?
+        throw new Error('SESSION_EXPIRED'); // Force re-login
+      }
+    }
 
     let details = {
       renewalDate: null,
@@ -334,7 +396,7 @@ function getSessionDiagnostics(chatId) {
 
 async function deleteSession(chatId) {
   const sp = statePath(chatId);
-  await closeUser(chatId).catch(() => {});
+  await closeUser(chatId).catch(() => { });
   if (fs.existsSync(sp)) fs.unlinkSync(sp);
   return true;
 }
