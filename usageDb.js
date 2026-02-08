@@ -48,6 +48,15 @@ function initUsageDb() {
       )
     `);
 
+    // 🔥 New User States Table for Wizard Persistence
+    db.run(`
+      CREATE TABLE IF NOT EXISTS user_states (
+        chatId TEXT PRIMARY KEY,
+        stateData TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+
     // ترقيات لو DB قديمة
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerMonthlyEGP REAL`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
@@ -182,6 +191,35 @@ function deleteSessionRecord(chatId) {
   });
 }
 
+// 🔥 User State Management Functions
+function saveUserState(chatId, stateData) {
+  return new Promise((resolve, reject) => {
+    const now = new Date().toISOString();
+    db.run(
+      `INSERT INTO user_states(chatId, stateData, updatedAt) VALUES(?, ?, ?)
+       ON CONFLICT(chatId) DO UPDATE SET stateData=excluded.stateData, updatedAt=excluded.updatedAt`,
+      [String(chatId), JSON.stringify(stateData), now],
+      (e) => (e ? reject(e) : resolve(true))
+    );
+  });
+}
+
+function getUserState(chatId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT stateData FROM user_states WHERE chatId=?`,
+      [String(chatId)],
+      (e, row) => (e ? reject(e) : resolve(row ? JSON.parse(row.stateData) : null))
+    );
+  });
+}
+
+function deleteUserState(chatId) {
+  return new Promise((resolve, reject) => {
+    db.run(`DELETE FROM user_states WHERE chatId=?`, [String(chatId)], (e) => (e ? reject(e) : resolve(true)));
+  });
+}
+
 module.exports = {
   initUsageDb,
   insertSnapshot,
@@ -193,4 +231,7 @@ module.exports = {
   saveSession,
   getSession,
   deleteSessionRecord,
+  saveUserState,
+  getUserState,
+  deleteUserState,
 };

@@ -22,6 +22,9 @@ const {
   saveSnapshot,
   getTodayUsage,
   getAvgDailyUsage,
+  saveUserState,
+  getUserState,
+  deleteUserState,
 } = require('./usageDb');
 
 const { checkRateLimit } = require('./rateLimiter');
@@ -40,8 +43,8 @@ const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 3600000 });
 cronService.init();
 notificationService.setBot(bot);
 
-// Simple User State Map
-const userState = new Map(); // chatId -> { stage, serviceNumber }
+// Simple User State Map (REMOVED - Switched to DB)
+// const userState = new Map();
 
 // ============ Helpers ============
 
@@ -107,8 +110,8 @@ async function handleStatus(ctx) {
     // Try Cache First
     const cachedData = cacheService.get(`status:${chatId}`);
     if (cachedData) {
-      if (msg) ctx.telegram.editMessageText(chatId, msg.message_id, undefined, formatStatus(cachedData.data, cachedData.today, cachedData.avg), { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-      else ctx.reply(formatStatus(cachedData.data, cachedData.today, cachedData.avg), { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+      if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, formatStatus(cachedData.data, cachedData.today, cachedData.avg), { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+      else await ctx.reply(formatStatus(cachedData.data, cachedData.today, cachedData.avg), { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
       return;
     }
 
@@ -189,7 +192,7 @@ bot.action('renew_quota', async (ctx) => {
 });
 
 bot.action('link_account', async (ctx) => {
-  userState.set(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
+  await saveUserState(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
   await ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
 });
 
@@ -213,7 +216,7 @@ bot.command('link', async (ctx) => await ctx.reply('📞 ابعت رقم الخ�
 // Linking Wizard Logic
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
-  const state = userState.get(chatId);
+  const state = await getUserState(chatId);
   const text = ctx.message.text.trim();
 
   if (!state) return;
