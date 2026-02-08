@@ -40,6 +40,9 @@ const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 3600000 });
 cronService.init();
 notificationService.setBot(bot);
 
+// Simple User State Map
+const userState = new Map(); // chatId -> { stage, serviceNumber }
+
 // ============ Helpers ============
 
 function to2(n) {
@@ -156,9 +159,12 @@ bot.action('show_chart', async (ctx) => {
     }
 
     // Generate Chart
-    // const imagePath = await chartService.generateUsageChart(chatId, cached.data);
-    // await ctx.replyWithPhoto({ source: imagePath });
-    ctx.reply("⚠️ خدمة الرسوم البيانية جاري تفعيلها...");
+    const imagePath = await chartService.generateUsageChart(chatId, cached.data);
+    await ctx.replyWithPhoto({ source: { filename: imagePath } }, {
+      caption: `📊 رسم بياني لاستهلاك *${cached.data.plan || 'الباقة'}*\n📅 تم التحديث: ${new Date().toLocaleTimeString('ar-EG')}`,
+      parse_mode: 'Markdown',
+      ...getMainKeyboard(chatId)
+    });
 
   } catch (err) {
     handleError(ctx, err, 'chart');
@@ -182,7 +188,10 @@ bot.action('renew_quota', (ctx) => {
   ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
 });
 
-bot.action('link_account', (ctx) => ctx.reply('📞 ابعت رقم الخدمة (Service Number) دلوقتي:'));
+bot.action('link_account', (ctx) => {
+  userState.set(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
+  ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
+});
 
 bot.action('logout', (ctx) => {
   const chatId = ctx.chat.id;
@@ -195,16 +204,42 @@ bot.action('logout', (ctx) => {
 bot.command('status', handleStatus);
 bot.command('link', (ctx) => ctx.reply('📞 ابعت رقم الخدمة (Service Number):'));
 
-// Linking Logic (Simplified Text Handler)
+// Linking Wizard Logic
 bot.on('text', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const state = userState.get(chatId);
   const text = ctx.message.text.trim();
-  if (!/^\d+$/.test(text) && text.length > 5) {
-    // Assume it's a password if not simple number? No, keep simple state machine later
-    // For now, simple instruction
+
+  if (!state) return;
+
+  try {
+    if (state.stage === 'AWAITING_SERVICE_NUMBER') {
+      if (!/^\d+$/.test(text) || text.length < 7) {
+        return ctx.reply('⚠️ رقم الخدمة لازم يكون أرقام بس وطوله مناسب. جرب تاني:');
+      }
+      state.serviceNumber = text;
+      state.stage = 'AWAITING_PASSWORD';
+      ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
+    }
+    else if (state.stage === 'AWAITING_PASSWORD') {
+      const password = text;
+      userState.delete(chatId); // Clear state
+
+      const loadingMsg = await ctx.reply('⏳ جاري تسجيل الدخول وحفظ الجلسة في قاعدة البيانات...', { parse_mode: 'Markdown' });
+
+      try {
+        await loginAndSave(chatId, state.serviceNumber, password);
+        ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, '✅ تم ربط الحساب بنجاح! هجيبلك بياناتك دلوقتي...');
+
+        // Auto-fetch status after link
+        handleStatus(ctx);
+      } catch (err) {
+        ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, `❌ فشل ربط الحساب: ${err.message}\n\nتأكد من الرقم والباسورد وجرب تاني باستخدام /link`);
+      }
+    }
+  } catch (err) {
+    handleError(ctx, err, 'linking_wizard');
   }
-  // Note: Full linking wizard requires state machine (like in original bot.js)
-  // We will keep the original linking logic structure in a separate module or here if needed.
-  // For brevity in this plan, I'm focusing on the integration points.
 });
 
 // ============ Webhook / Server ============

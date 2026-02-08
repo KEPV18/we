@@ -7,6 +7,16 @@ const DEBUG = String(process.env.DEBUG_WE || '').trim() === '1';
 const userPool = new Map(); // chatId -> { context, page, diagnostics }
 let sharedBrowser = null;
 
+const {
+  initUsageDb,
+  saveSnapshot,
+  getTodayUsage,
+  getAvgDailyUsage,
+  saveSession,
+  getSession,
+  deleteSessionRecord,
+} = require('./usageDb');
+
 function debugLog(...args) { if (DEBUG) console.log('[WE-DEBUG]', ...args); }
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 function statePath(chatId) { return path.join(__dirname, 'sessions', `state-${chatId}.json`); }
@@ -75,10 +85,20 @@ async function closeUser(chatId) {
 
 async function ensureContext(chatId, forceNew = false) {
   const sp = statePath(chatId);
-  if (!fs.existsSync(sp)) throw new Error('NO_SESSION');
   const entry = getUserEntry(chatId);
   if (forceNew) await closeUser(chatId);
   if (entry.context) return entry.context;
+
+  // 🔥 1. Check DB first (The Radical Solution)
+  const dbSession = await getSession(chatId);
+  if (dbSession) {
+    debugLog(`Restoring session for ${chatId} from Database...`);
+    ensureDir(path.dirname(sp));
+    fs.writeFileSync(sp, JSON.stringify(dbSession));
+  } else if (!fs.existsSync(sp)) {
+    throw new Error('NO_SESSION');
+  }
+
   const browser = await getBrowser();
   entry.context = await browser.newContext({ storageState: sp });
   return entry.context;
@@ -210,10 +230,18 @@ async function loginAndSave(chatId, serviceNumber, password) {
       // Check for error messages on page
       const errorMsg = await page.locator('.ant-message-notice, .error-message').innerText().catch(() => '');
       if (errorMsg) throw new Error(`WE_SITE_ERROR: ${errorMsg}`);
+      // Fallback error
       throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
     }
 
-    await context.storageState({ path: statePath(chatId) });
+    const sp = statePath(chatId);
+    await context.storageState({ path: sp });
+
+    // 🔥 2. Save to DB AFTER saving to file
+    const stateData = JSON.parse(fs.readFileSync(sp, 'utf8'));
+    await saveSession(chatId, stateData);
+    debugLog(`Session for ${chatId} persisted to Database.`);
+
     await closeUser(chatId);
     return true;
   } catch (err) {
@@ -398,6 +426,10 @@ async function deleteSession(chatId) {
   const sp = statePath(chatId);
   await closeUser(chatId).catch(() => { });
   if (fs.existsSync(sp)) fs.unlinkSync(sp);
+
+  // 🔥 3. Delete from DB
+  await deleteSessionRecord(chatId).catch(() => { });
+  debugLog(`Session for ${chatId} deleted from DB.`);
   return true;
 }
 

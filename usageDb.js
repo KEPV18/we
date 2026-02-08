@@ -39,6 +39,15 @@ function initUsageDb() {
 
     db.run(`CREATE INDEX IF NOT EXISTS idx_snapshots_chat_day ON snapshots(chatId, day)`);
 
+    // 🔥 New Sessions Table for Persistent Logins
+    db.run(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        chatId TEXT PRIMARY KEY,
+        sessionData TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )
+    `);
+
     // ترقيات لو DB قديمة
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerMonthlyEGP REAL`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
@@ -144,6 +153,35 @@ async function getAvgDailyUsage(chatId, days = 14) {
   return sum / deltas.length;
 }
 
+// 🔥 Session Management Functions
+function saveSession(chatId, sessionData) {
+  return new Promise((resolve, reject) => {
+    const now = new Date().toISOString();
+    db.run(
+      `INSERT INTO sessions(chatId, sessionData, updatedAt) VALUES(?, ?, ?)
+       ON CONFLICT(chatId) DO UPDATE SET sessionData=excluded.sessionData, updatedAt=excluded.updatedAt`,
+      [String(chatId), JSON.stringify(sessionData), now],
+      (e) => (e ? reject(e) : resolve(true))
+    );
+  });
+}
+
+function getSession(chatId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT sessionData FROM sessions WHERE chatId=?`,
+      [String(chatId)],
+      (e, row) => (e ? reject(e) : resolve(row ? JSON.parse(row.sessionData) : null))
+    );
+  });
+}
+
+function deleteSessionRecord(chatId) {
+  return new Promise((resolve, reject) => {
+    db.run(`DELETE FROM sessions WHERE chatId=?`, [String(chatId)], (e) => (e ? reject(e) : resolve(true)));
+  });
+}
+
 module.exports = {
   initUsageDb,
   insertSnapshot,
@@ -152,4 +190,7 @@ module.exports = {
   getLastOfDay,
   getTodayUsage,
   getAvgDailyUsage,
+  saveSession,
+  getSession,
+  deleteSessionRecord,
 };
