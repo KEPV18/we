@@ -126,8 +126,8 @@ async function handleStatus(ctx) {
     cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
 
     const text = formatStatus(data, todayUsage, avgUsage);
-    if (msg) ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-    else ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+    if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+    else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
 
   } catch (err) {
     handleError(ctx, err, 'status');
@@ -136,8 +136,8 @@ async function handleStatus(ctx) {
 
 // ============ Actions & Commands ============
 
-bot.start((ctx) => {
-  ctx.reply(
+bot.start(async (ctx) => {
+  await ctx.reply(
     '👋 أهلاً بيك في بوت WE Usage!\n\nاستخدم القائمة اللي تحت للتحكم في البوت:',
     getMainKeyboard(ctx.chat.id)
   );
@@ -173,36 +173,42 @@ bot.action('show_chart', async (ctx) => {
 
 bot.action('show_today', async (ctx) => {
   const chatId = ctx.chat.id;
-  ctx.answerCbQuery();
+  await ctx.answerCbQuery();
 
   try {
     const today = await getTodayUsage(chatId);
-    ctx.reply(`📅 استهلاكك النهاردة: *${to2(today)} GB*`, { parse_mode: 'Markdown' });
+    await ctx.reply(`📅 استهلاكك النهاردة: *${to2(today)} GB*`, { parse_mode: 'Markdown' });
   } catch (err) {
     handleError(ctx, err, 'today');
   }
 });
 
-bot.action('renew_quota', (ctx) => {
-  ctx.answerCbQuery();
-  ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
+bot.action('renew_quota', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
 });
 
-bot.action('link_account', (ctx) => {
+bot.action('link_account', async (ctx) => {
   userState.set(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
-  ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
+  await ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
 });
 
-bot.action('logout', (ctx) => {
+bot.action('logout', async (ctx) => {
   const chatId = ctx.chat.id;
-  deleteSession(chatId);
+  await deleteSession(chatId);
   cacheService.del(`status:${chatId}`);
-  ctx.answerCbQuery('تم الخروج');
-  ctx.editMessageText('✅ تم تسجيل الخروج بنجاح.', getMainKeyboard(chatId));
+  await ctx.answerCbQuery('تم الخروج').catch(() => { });
+  try {
+    await ctx.editMessageText('✅ تم تسجيل الخروج بنجاح.', getMainKeyboard(chatId));
+  } catch (err) {
+    if (!err.description?.includes('message is not modified')) {
+      logger.error('Logout UI Error', err);
+    }
+  }
 });
 
 bot.command('status', handleStatus);
-bot.command('link', (ctx) => ctx.reply('📞 ابعت رقم الخدمة (Service Number):'));
+bot.command('link', async (ctx) => await ctx.reply('📞 ابعت رقم الخدمة (Service Number):'));
 
 // Linking Wizard Logic
 bot.on('text', async (ctx) => {
@@ -265,6 +271,16 @@ app.listen(PORT, async () => {
 
 // Init DB
 try { initUsageDb(); } catch (e) { logger.error('DB Init Error', e); }
+
+// Graceful Shutdown
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+async function shutdown(signal) {
+  logger.info(`Received ${signal}. Shutting down gracefully...`);
+  bot.stop(signal); // Stop Telegraf processing
+  process.exit(0);
+}
 
 // Graceful Shutdown
 process.once('SIGINT', () => shutdown('SIGINT'));
