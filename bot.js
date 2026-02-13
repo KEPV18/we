@@ -48,6 +48,14 @@ cronService.setBot(bot);
 cronService.init();
 notificationService.setBot(bot);
 
+// Set Bot Menu Commands
+bot.telegram.setMyCommands([
+  { command: 'status', description: '🔄 تحديث الاستهلاك الآن' },
+  { command: 'link', description: '🔗 ربط حساب WE جديد' },
+  { command: 'logout', description: '🚪 تسجيل الخروج ومسح البيانات' },
+  { command: 'start', description: '👋 البدء وإظهار القائمة' }
+]).catch(err => logger.error('Failed to set bot commands', err));
+
 // Simple User State Map (REMOVED - Switched to DB)
 // const userState = new Map();
 
@@ -114,23 +122,37 @@ function formatStatus(data, todayUsage, avgUsage) {
 }
 
 function getMainKeyboard(chatId) {
-  return Markup.inlineKeyboard([
-    [
-      Markup.button.callback('🔄 تحديث الآن', 'refresh_status'),
-      Markup.button.callback('📊 رسم بياني', 'show_chart')
-    ],
-    [
-      Markup.button.callback('📅 استهلاك اليوم', 'show_today'),
-      Markup.button.callback('♻️ تجديد الباقة', 'renew_quota')
-    ],
-    [
-      Markup.button.callback('🔗 ربط حساب جديد', 'link_account'),
-      Markup.button.callback('🚪 تسجيل خروج', 'logout')
-    ]
-  ]);
+  return Markup.keyboard([
+    ['🔄 تحديث الآن', '📊 رسم بياني'],
+    ['📅 استهلاك اليوم', '♻️ تجديد الباقة'],
+    ['🔗 ربط حساب جديد', '🚪 تسجيل خروج']
+  ]).resize();
 }
 
 // ============ Handlers ============
+
+async function handleLink(ctx) {
+  await saveUserState(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
+  const text = '📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):';
+  if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(text);
+}
+
+async function handleLogout(ctx) {
+  const chatId = ctx.chat.id;
+  await deleteSession(chatId);
+  await deleteCredentials(chatId);
+  cacheService.del(`status:${chatId}`);
+  
+  if (ctx.callbackQuery) await ctx.answerCbQuery('تم الخروج').catch(() => { });
+  
+  const text = '✅ تم تسجيل الخروج بنجاح ومسح جميع بياناتك.';
+  try {
+    await ctx.reply(text, getMainKeyboard(chatId));
+  } catch (err) {
+    logger.error('Logout UI Error', err);
+  }
+}
 
 async function handleStatus(ctx, retryCount = 0) {
   const chatId = ctx.chat.id;
@@ -155,7 +177,7 @@ async function handleStatus(ctx, retryCount = 0) {
       const cachedData = cacheService.get(`status:${chatId}`);
       if (cachedData) {
         const text = formatStatus(cachedData.data, cachedData.today, cachedData.avg);
-        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
         else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
         return;
       }
@@ -175,7 +197,7 @@ async function handleStatus(ctx, retryCount = 0) {
     cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
 
     const text = formatStatus(data, todayUsage, avgUsage);
-    if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+    if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
     else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
 
   } catch (err) {
@@ -187,7 +209,7 @@ async function handleStatus(ctx, retryCount = 0) {
       if (retryCount >= 1) {
         logger.warn(`Auto-login loop detected for ${chatId}. Aborting.`);
         const failText = '❌ فشل تحديث البيانات بعد محاولة الدخول. ممكن الباسورد اتغير؟\nمن فضلك "تسجيل خروج" وادخل البيانات الجديدة.';
-        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, failText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, failText, { parse_mode: 'Markdown' });
         else await ctx.reply(failText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
         return;
       }
@@ -208,14 +230,14 @@ async function handleStatus(ctx, retryCount = 0) {
           logger.error(`Auto-login failed for ${chatId}`, loginErr);
           const loginFailText = `❌ فشل الدخول التلقائي: ${loginErr.message}\nمن فضلك اربط الحساب تاني باستخدام "تسجيل خروج" ثم "ربط حساب جديد".`;
           if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, loginFailText, { parse_mode: 'Markdown' });
-          else await ctx.reply(loginFailText, { parse_mode: 'Markdown' });
+          else await ctx.reply(loginFailText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
         }
       } else {
         // No credentials saved, start linking wizard automatically
         await saveUserState(chatId, { stage: 'AWAITING_SERVICE_NUMBER' });
         const linkPrompt = '⚠️ مفيش حساب مربوط. من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):';
         if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, linkPrompt);
-        else await ctx.reply(linkPrompt);
+        else await ctx.reply(linkPrompt, getMainKeyboard(chatId));
       }
     } else {
       await handleError(ctx, err, 'status');
@@ -223,23 +245,9 @@ async function handleStatus(ctx, retryCount = 0) {
   }
 }
 
-// ============ Actions & Commands ============
-
-bot.start(async (ctx) => {
-  await ctx.reply(
-    '👋 أهلاً بيك في بوت WE Usage!\n\nاستخدم القائمة اللي تحت للتحكم في البوت:',
-    getMainKeyboard(ctx.chat.id)
-  );
-});
-
-bot.action('refresh_status', async (ctx) => {
-  await ctx.answerCbQuery('🔄 جاري التحديث...');
-  await handleStatus(ctx);
-});
-
-bot.action('show_chart', async (ctx) => {
+async function handleChart(ctx) {
   const chatId = ctx.chat.id;
-  await ctx.answerCbQuery('📊 جاري رسم البيانات...');
+  if (ctx.callbackQuery) await ctx.answerCbQuery('📊 جاري رسم البيانات...');
 
   try {
     const cached = cacheService.get(`status:${chatId}`);
@@ -251,18 +259,17 @@ bot.action('show_chart', async (ctx) => {
     const imagePath = await chartService.generateUsageChart(chatId, cached.data);
     await ctx.replyWithPhoto({ source: { filename: imagePath } }, {
       caption: `📊 رسم بياني لاستهلاك *${cached.data.plan || 'الباقة'}*\n📅 تم التحديث: ${new Date().toLocaleTimeString('ar-EG')}`,
-      parse_mode: 'Markdown',
-      ...getMainKeyboard(chatId)
+      parse_mode: 'Markdown'
     });
 
   } catch (err) {
     await handleError(ctx, err, 'chart');
   }
-});
+}
 
-bot.action('show_today', async (ctx) => {
+async function handleToday(ctx) {
   const chatId = ctx.chat.id;
-  await ctx.answerCbQuery();
+  if (ctx.callbackQuery) await ctx.answerCbQuery();
 
   try {
     const today = await getTodayUsage(chatId);
@@ -273,46 +280,64 @@ bot.action('show_today', async (ctx) => {
   } catch (err) {
     await handleError(ctx, err, 'today');
   }
-});
+}
 
-bot.action('renew_quota', async (ctx) => {
-  await ctx.answerCbQuery();
+async function handleRenew(ctx) {
+  if (ctx.callbackQuery) await ctx.answerCbQuery();
   await ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
+}
+
+// ============ Actions & Commands ============
+
+bot.start(async (ctx) => {
+  await ctx.reply(
+    '👋 أهلاً بيك في بوت WE Usage!\n\nاستخدم القائمة اللي تحت للتحكم في البوت:',
+    getMainKeyboard(ctx.chat.id)
+  );
 });
 
-bot.action('link_account', async (ctx) => {
-  await saveUserState(ctx.chat.id, { stage: 'AWAITING_SERVICE_NUMBER' });
-  await ctx.reply('📞 من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):');
-});
-
-bot.action('logout', async (ctx) => {
-  const chatId = ctx.chat.id;
-  await deleteSession(chatId);
-  await deleteCredentials(chatId); // 🔥 Also remove credentials
-  cacheService.del(`status:${chatId}`);
-  await ctx.answerCbQuery('تم الخروج').catch(() => { });
-  try {
-    await ctx.editMessageText('✅ تم تسجيل الخروج بنجاح.', getMainKeyboard(chatId));
-  } catch (err) {
-    if (!err.description?.includes('message is not modified')) {
-      logger.error('Logout UI Error', err);
-    }
-  }
-});
+bot.action('refresh_status', handleStatus);
+bot.action('show_chart', handleChart);
+bot.action('show_today', handleToday);
+bot.action('renew_quota', handleRenew);
+bot.action('link_account', handleLink);
+bot.action('logout', handleLogout);
 
 bot.command('status', handleStatus);
-bot.command('link', async (ctx) => await ctx.reply('📞 ابعت رقم الخدمة (Service Number):'));
+bot.command('link', handleLink);
+bot.command('logout', handleLogout);
 
 // Linking Wizard Logic
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
-  const state = await getUserState(chatId);
   const text = ctx.message.text.trim();
+  const lowerText = text.toLowerCase();
+  const state = await getUserState(chatId);
 
   if (!state) {
-    // If user sends text but has no active state (e.g. after restart), guide them
+    // Check for Reply Keyboard buttons or common keywords
+    if (text.includes('تحديث') || ['status', 'refresh'].includes(lowerText)) {
+      return handleStatus(ctx);
+    }
+    if (text.includes('رسم بياني') || ['chart', 'graph'].includes(lowerText)) {
+      return handleChart(ctx);
+    }
+    if (text.includes('استهلاك اليوم') || ['today', 'usage'].includes(lowerText)) {
+      return handleToday(ctx);
+    }
+    if (text.includes('تجديد الباقة') || ['renew'].includes(lowerText)) {
+      return handleRenew(ctx);
+    }
+    if (text.includes('ربط حساب') || ['link', 'setup'].includes(lowerText)) {
+      return handleLink(ctx);
+    }
+    if (text.includes('تسجيل خروج') || ['logout', 'exit'].includes(lowerText)) {
+      return handleLogout(ctx);
+    }
+
+    // Default fallback for private chats
     if (ctx.chat.type === 'private') {
-      return await ctx.reply('⚠️ لا يوجد أمر نشط حالياً. استخدم القائمة الرئيسية أو /link للبدء.', getMainKeyboard(chatId));
+      return await ctx.reply('👋 أهلاً بيك! استخدم الأزرار بالأسفل للتحكم في البوت:', getMainKeyboard(chatId));
     }
     return;
   }
