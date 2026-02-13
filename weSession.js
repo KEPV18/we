@@ -1,554 +1,551 @@
 // weSession.js
+require('dotenv').config();
+
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
-const SEL = require('./selectors');
 const logger = require('./logger');
+const SEL = require('./selectors');
+const { getCredentials } = require('./usageDb');
 
-const { saveSession, getSession, deleteSessionRecord, getCredentials } = require('./usageDb');
+const SESS_DIR = path.join(__dirname, 'sessions');
+if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR, { recursive: true });
 
-const DEBUG = String(process.env.DEBUG_WE || '').trim() === '1';
+const DEBUG = process.env.DEBUG_WE === '1';
+const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 
-const MAX_LOGIN_RETRIES = 3;
-const LONG_TIMEOUT = 120000;
-const MAX_AUTO_RELOGIN = 2;
+function dlog(...args) {
+  if (DEBUG) console.log('[WE-DEBUG]', ...args);
+}
 
-// Render/Linux safe args
-const isLinux = process.platform === 'linux';
-const BROWSER_LAUNCH_ARGS = isLinux
-  ? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-  : [];
+function sessPath(chatId) {
+  return path.join(SESS_DIR, `state-${chatId}.json`);
+}
 
-let sharedBrowser = null;
-
-// Prevent overlap per chatId
-const sessionLocks = new Map();
-const diagnostics = new Map();
-
-function debugLog(...args) { if (DEBUG) console.log('[WE-DEBUG]', ...args); }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
-function sessionsDir() { const d = path.join(__dirname, 'sessions'); ensureDir(d); return d; }
-function statePath(chatId) { return path.join(sessionsDir(), `state-${chatId}.json`); }
-function debugShotPath(chatId, name) { return path.join(sessionsDir(), `debug-${chatId}-${name}-${Date.now()}.png`); }
-
-async function safeShot(page, chatId, name) {
+function readState(chatId) {
   try {
-    if (!DEBUG || !page) return;
-    const p = debugShotPath(chatId, name);
-    await page.screenshot({ path: p, fullPage: true }).catch(() => null);
-    debugLog('Saved screenshot:', p);
+    const p = sessPath(chatId);
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeState(chatId, state) {
+  try {
+    fs.writeFileSync(sessPath(chatId), JSON.stringify(state, null, 2), 'utf8');
   } catch {}
 }
 
-function numFromText(t) {
-  const m = String(t ?? '')
-    .replace(/\u00A0/g, ' ')
-    .replace(/,/g, '.')
-    .match(/([\d.]+)/);
+function deleteState(chatId) {
+  try {
+    const p = sessPath(chatId);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {}
+}
+
+function isProbablySignedOut(url) {
+  return String(url || '').includes('/home/signin');
+}
+
+function normalizeNumber(s) {
+  if (!s) return null;
+  // remove commas, NBSP etc
+  const x = String(s).replace(/[,\u00A0]/g, '').trim();
+  const m = x.match(/(\d+(\.\d+)?)/);
   return m ? Number(m[1]) : null;
 }
 
-function isClosedContextError(err) {
-  const msg = String(err?.message || err || '');
-  return msg.includes('Target closed')
-    || msg.includes('has been closed')
-    || msg.includes('Execution context was destroyed');
+function extractPlan(body) {
+  // Try regex first as fallback
+  const m = body.match(/Your Current Plan\s*([\s\S]{0,80})/i);
+  if (m) {
+    const chunk = m[1].trim().split('\n').map(s => s.trim()).filter(Boolean);
+    if (chunk[0]) return chunk[0];
+  }
+  return null;
 }
 
-function isMissingBrowserError(err) {
-  const msg = String(err?.message || err || '');
-  return msg.includes("Executable doesn't exist at") || msg.includes('download new browsers');
+async function extractPlanSelector(page) {
+  try {
+    // Look for first span with title (common pattern for plan name in WE)
+    const titles = page.locator('span[title]');
+    const count = await titles.count().catch(() => 0);
+    for (let i = 0; i < Math.min(count, 10); i++) {
+      const t = await titles.nth(i).getAttribute('title').catch(() => null);
+      if (t && t.length > 3 && t.length < 100 && !t.includes('Details') && !t.includes('More')) {
+        return t.trim();
+      }
+    }
+  } catch (err) {
+    dlog('extractPlanSelector error:', err.message);
+  }
+  return null;
+}
+
+async function extractUsageSelectors(page) {
+  try {
+    const remBox = page.locator('span', { hasText: /Remaining/i }).first().locator('xpath=..');
+    const usedBox = page.locator('span', { hasText: /Used/i }).first().locator('xpath=..');
+    
+    const remTxt = await remBox.innerText().catch(() => '');
+    const usedTxt = await usedBox.innerText().catch(() => '');
+
+    return {
+      remainingGB: normalizeNumber(remTxt),
+      usedGB: normalizeNumber(usedTxt),
+    };
+  } catch (err) {
+    dlog('extractUsageSelectors error:', err.message);
+  }
+  return { remainingGB: null, usedGB: null };
+}
+
+async function extractBalanceSelector(page) {
+  try {
+    const balBlock = page.locator('text=Current Balance').locator('xpath=..');
+    const txt = await balBlock.innerText().catch(() => '');
+    return normalizeNumber(txt);
+  } catch (err) {
+    dlog('extractBalanceSelector error:', err.message);
+  }
+  return null;
+}
+
+function extractUsage(body) {
+  const idx = body.indexOf('Home Internet');
+  if (idx === -1) return { remainingGB: null, usedGB: null };
+
+  const slice = body.slice(idx, idx + 500);
+  const rem = slice.match(/(\d+(\.\d+)?)\s*Remaining/i);
+  const used = slice.match(/(\d+(\.\d+)?)\s*Used/i);
+
+  return {
+    remainingGB: rem ? Number(rem[1]) : null,
+    usedGB: used ? Number(used[1]) : null,
+  };
+}
+
+function extractBalance(body) {
+  // Current Balance \n 50 \n EGP
+  const m = body.match(/Current Balance\s*([\s\S]{0,80})/i);
+  if (!m) return null;
+  const chunk = m[1].split('\n').map(s => s.trim()).filter(Boolean).slice(0, 5).join(' ');
+  // غالبًا رقم قبل EGP
+  const n = chunk.match(/(\d+(\.\d+)?)/);
+  return n ? Number(n[1]) : null;
+}
+
+function extractTotalFromPlan(plan) {
+  // (400GB)
+  const m = String(plan || '').match(/\((\d+)\s*GB\)/i);
+  return m ? Number(m[1]) : null;
+}
+
+function extractRenewalInfo(body) {
+  // نحاول نلقط:
+  // Renewal Date ... 11-03-2026
+  // أو "Renewal Date" قد تكون بتنسيق مختلف
+  const date =
+    (body.match(/Renewal\s*Date\s*[:\-]?\s*([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})/i) || [])[1] ||
+    (body.match(/تاريخ\s*التجديد\s*[:\-]?\s*([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})/i) || [])[1] ||
+    null;
+
+  // سعر الباقة: غالبًا رقم كبير قريب من كلمة Renew أو EGP
+  // (مش مثالي بس عملي)
+  let price = null;
+  const priceM =
+    body.match(/(Plan Price|Renew|Package Price|سعر الباقة)[\s\S]{0,60}?(\d+(\.\d+)?)/i) ||
+    body.match(/\b(\d+(\.\d+)?)\s*EGP\b/i);
+  if (priceM) price = normalizeNumber(priceM[2] || priceM[1]);
+
+  // زر Renew enabled؟
+  const hasRenewBtn = /Renew/i.test(body);
+
+  // Router
+  const routerName = /PREMIUM\s*Router/i.test(body) ? 'PREMIUM Router' : (/(Router)/i.test(body) ? 'Router' : null);
+
+  // Router monthly
+  let routerMonthly = null;
+  const rm = body.match(/(Router|PREMIUM\s*Router)[\s\S]{0,60}?(\d+(\.\d+)?)/i);
+  if (rm) routerMonthly = normalizeNumber(rm[2]);
+
+  // Router renewal date
+  const routerDate =
+    (body.match(/Router[\s\S]{0,120}?([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})/i) || [])[1] ||
+    null;
+
+  return {
+    renewalDate: date,
+    renewPriceEGP: price,
+    renewBtnEnabled: hasRenewBtn ? true : null,
+    routerName,
+    routerMonthlyEGP: routerMonthly,
+    routerRenewalDate: routerDate,
+  };
+}
+
+async function dumpOnce(page, chatId, tag) {
+  if (!DEBUG_DUMP) return;
+  try {
+    const ts = Date.now();
+    const base = path.join(SESS_DIR, `dump-${chatId}-${tag}-${ts}`);
+    await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => {});
+    const html = await page.content().catch(() => '');
+    fs.writeFileSync(`${base}.html`, html, 'utf8');
+    const txt = await page.locator('body').innerText().catch(() => '');
+    fs.writeFileSync(`${base}.txt`, txt, 'utf8');
+    dlog(`Saved dump: ${base}.(png|html|txt)`);
+  } catch {}
+}
+
+async function launchBrowser() {
+  const headless = process.env.HEADLESS === '0' ? false : true;
+  return chromium.launch({
+    headless,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+    ],
+  });
+}
+
+async function newContext(browser, storageState) {
+  return browser.newContext(storageState ? { storageState } : {});
+}
+
+async function gotoAccountOverview(page) {
+  await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+
+  // استنى SPA تحمّل (على Render بتتأخر)
+  await page.waitForTimeout(1200);
+  await page.waitForSelector(SEL.markerUsageOverviewText, { timeout: 60000 }).catch(() => {});
+  await page.waitForSelector(SEL.balanceText, { timeout: 60000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
+  return page.url();
+}
+
+async function gotoUsagePage(page) {
+  await page.goto(SEL.usageUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.waitForTimeout(1200);
+  await page.waitForSelector(SEL.markerHomeInternetText, { timeout: 60000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  return page.url();
+}
+
+async function selectInternetServiceTypeKeyboard(page) {
+  // افتح dropdown
+  await page.locator(SEL.selectServiceTypeTrigger).click({ timeout: 30000 });
+  await page.waitForTimeout(400);
+
+  // استخدم keyboard لتفادي viewport issues
+  // جرّب Down + Enter كذا مرة لحد ما يبقى المختار Internet
+  for (let i = 0; i < 6; i++) {
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(120);
+    const body = await page.locator('body').innerText().catch(() => '');
+    if (/Internet/i.test(body)) {
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(300);
+      return true;
+    }
+  }
+
+  // fallback: حاول click داخل dropdown المرئي
+  const opt = page
+    .locator(SEL.selectDropdownVisible)
+    .locator(SEL.selectServiceTypeOption)
+    .filter({ hasText: /Internet/i })
+    .first();
+
+  await opt.scrollIntoViewIfNeeded().catch(() => {});
+  await opt.click({ force: true, timeout: 15000 });
+  return true;
+}
+
+async function loginFlow(page, serviceNumber, password, chatId) {
+  await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.waitForTimeout(800);
+
+  await page.click(SEL.inputService, { timeout: 60000 });
+  await page.fill(SEL.inputService, String(serviceNumber));
+  await page.waitForTimeout(300);
+
+  dlog('Selecting service type (keyboard)...');
+  await selectInternetServiceTypeKeyboard(page);
+
+  await page.click(SEL.inputPassword, { timeout: 60000 });
+  await page.fill(SEL.inputPassword, String(password));
+  await page.waitForTimeout(600);
+
+  dlog('Clicking login button...');
+  await page.click(SEL.loginButton, { timeout: 60000 });
+
+  // استنى التحويل للـ accountoverview
+  await page.waitForURL(/accountoverview/i, { timeout: 90000 });
+  await page.waitForTimeout(1000);
+
+  await dumpOnce(page, chatId, 'AFTER_LOGIN');
+}
+
+async function openMoreDetails(page) {
+  // جرّب نصوص متعددة عربي/إنجليزي
+  const texts = SEL.moreDetailsTexts || ['More Details', 'Details', 'مزيد من التفاصيل', 'تفاصيل'];
+
+  for (const t of texts) {
+    const selectors = [
+      `span:has-text("${t}")`,
+      `a:has-text("${t}")`,
+      `button:has-text("${t}")`,
+      `div:has-text("${t}")`
+    ];
+
+    for (const sel of selectors) {
+      try {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible().catch(() => false)) {
+          dlog(`Found more details button with selector: ${sel}`);
+          await loc.scrollIntoViewIfNeeded().catch(() => {});
+          await loc.click({ force: true, timeout: 8000 });
+          await page.waitForTimeout(2000);
+          return true;
+        }
+      } catch (err) {
+        // ignore and try next
+      }
+    }
+  }
+
+  // Fallback: evaluate click if not found via playwright locators
+  dlog('More details button not found via locators, trying evaluation fallback...');
+  const clicked = await page.evaluate((texts) => {
+    const elements = Array.from(document.querySelectorAll('span, a, button, div'));
+    for (const t of texts) {
+      const el = elements.find(e => (e.textContent || '').trim().toLowerCase() === t.toLowerCase());
+      if (el) {
+        el.scrollIntoView();
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }, texts).catch(() => false);
+
+  if (clicked) {
+    await page.waitForTimeout(2000);
+    return true;
+  }
+
+  return false;
+}
+
+function calcRemainingDays(renewalDateStr) {
+  if (!renewalDateStr) return null;
+  // dd-mm-yyyy
+  const m = renewalDateStr.match(/^(\d{2})[-/](\d{2})[-/](\d{4})$/);
+  if (!m) return null;
+  const dd = Number(m[1]), mm = Number(m[2]), yyyy = Number(m[3]);
+  const target = new Date(Date.UTC(yyyy, mm - 1, dd, 0, 0, 0));
+  const now = new Date();
+  const utcNow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+  const diffMs = target - utcNow;
+  return Math.max(0, Math.round(diffMs / (1000 * 60 * 60 * 24)));
+}
+
+function buildResult({ plan, remainingGB, usedGB, balanceEGP, renewalInfo }) {
+  const totalGB = extractTotalFromPlan(plan);
+  const renewalDate = renewalInfo.renewalDate || null;
+  const remainingDays = calcRemainingDays(renewalDate);
+
+  const renewPriceEGP = renewalInfo.renewPriceEGP ?? null;
+  const routerMonthlyEGP = renewalInfo.routerMonthlyEGP ?? null;
+
+  const totalRenewEGP =
+    (renewPriceEGP != null && routerMonthlyEGP != null)
+      ? (renewPriceEGP + routerMonthlyEGP)
+      : (renewPriceEGP ?? null);
+
+  const canAfford =
+    (balanceEGP != null && totalRenewEGP != null) ? (balanceEGP >= totalRenewEGP) : null;
+
+  return {
+    plan: plan || null,
+    remainingGB,
+    usedGB,
+    balanceEGP,
+    renewalDate,
+    remainingDays,
+    renewPriceEGP,
+    renewBtnEnabled: renewalInfo.renewBtnEnabled ?? null,
+    routerName: renewalInfo.routerName ?? null,
+    routerMonthlyEGP,
+    routerRenewalDate: renewalInfo.routerRenewalDate ?? null,
+    totalGB,
+    totalRenewEGP,
+    canAfford,
+    capturedAt: new Date().toISOString(),
+  };
 }
 
 function isSessionError(err) {
   const msg = String(err?.message || err || '');
-  return msg.includes('SESSION_EXPIRED')
-    || msg.includes('BROWSER_CLOSED')
-    || msg.includes('Target closed')
-    || msg.includes('Navigation failed')
-    || msg.includes('NO_SESSION')
-    || msg.includes('AUTO_RELOGIN_FAILED')
-    || msg.includes('net::ERR')
-    || msg.includes('BROWSER_CLOSED_DURING_FETCH')
-    || msg.includes('BROWSER_CLOSED_DURING_RENEW');
+  return (
+    msg.includes('BROWSER_CLOSED') ||
+    msg.includes('Target page, context or browser has been closed') ||
+    msg.includes('Execution context was destroyed') ||
+    msg.includes('net::ERR') ||
+    msg.includes('Timeout') ||
+    msg.includes('Sign in') ||
+    msg.includes('signin') ||
+    msg.includes('AUTO_RELOGIN_FAILED')
+  );
 }
 
-async function withLock(chatId, fn) {
-  const id = String(chatId);
-  const prev = sessionLocks.get(id) || Promise.resolve();
-  let release;
-  const gate = new Promise((r) => (release = r));
-  sessionLocks.set(id, prev.then(() => gate));
+// ================== Public API (used by bot.js) ==================
+
+async function loginAndSave(chatId, serviceNumber, password) {
+  let browser;
   try {
-    await prev;
-    return await fn();
-  } finally {
-    release();
-    setTimeout(() => {
-      if (sessionLocks.get(id) === gate) sessionLocks.delete(id);
-    }, 0);
-  }
-}
+    dlog(`Starting login for ${chatId} (Attempt 1/3)`);
 
-async function getBrowser() {
-  if (sharedBrowser?.isConnected()) return sharedBrowser;
+    browser = await launchBrowser();
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(60000);
 
-  const headless = process.env.WE_HEADLESS === '0' ? false : true;
+    await loginFlow(page, serviceNumber, password, chatId);
 
-  try {
-    sharedBrowser = await chromium.launch({
-      headless,
-      args: BROWSER_LAUNCH_ARGS,
-    });
+    // save storageState
+    const state = await ctx.storageState();
+    writeState(chatId, state);
+    dlog(`Session for ${chatId} persisted locally (storageState).`);
+
+    await ctx.close().catch(() => {});
+    await browser.close().catch(() => {});
+    return true;
   } catch (err) {
-    if (isMissingBrowserError(err)) throw new Error('BROWSER_NOT_INSTALLED');
+    try { await browser?.close?.(); } catch {}
+    logger.error(`Login failed for ${chatId}`, err);
     throw err;
   }
-
-  sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
-  return sharedBrowser;
 }
 
-async function ensureStorageStateFile(chatId) {
-  const sp = statePath(chatId);
-
-  const dbSession = await getSession(chatId);
-  if (dbSession) {
-    debugLog(`Restoring session for ${chatId} from Database...`);
-    fs.writeFileSync(sp, JSON.stringify(dbSession));
-    return sp;
-  }
-
-  if (!fs.existsSync(sp)) throw new Error('NO_SESSION');
-  return sp;
-}
-
-// ========== PARSERS ==========
-
-// accountoverview contains: plan + balance + remaining/used
-function parseAccountOverviewText(bodyText) {
-  const text = String(bodyText ?? '')
-    .replace(/\u00A0/g, ' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\r/g, '')
-    .trim();
-
-  let plan = '';
-  {
-    // "Your Current Plan" ثم اسم الباقة
-    const m = text.match(/Your Current Plan\s*([^\n]{3,80})/i);
-    if (m) plan = m[1].trim();
-  }
-  if (!plan) {
-    // fallback
-    const m = text.match(/Super speed[^\n]{0,80}/i);
-    if (m) plan = m[0].trim();
-  }
-
-  let balanceEGP = null;
-  {
-    const m = text.match(/Current Balance\s*([\d.,]+)\s*EGP/i);
-    if (m) balanceEGP = numFromText(m[1]);
-  }
-
-  let remainingGB = null;
-  let usedGB = null;
-  {
-    // Home Internet 361.56 Remaining 38.44 Used
-    const m = text.match(/Home Internet\s*([\d.,]+)\s*Remaining\s*([\d.,]+)\s*Used/i);
-    if (m) {
-      remainingGB = numFromText(m[1]);
-      usedGB = numFromText(m[2]);
-    }
-  }
-
-  return { plan, balanceEGP, remainingGB, usedGB };
-}
-
-// overview contains: renewal + router etc
-function parseOverviewDetailsText(bodyText) {
-  const text = String(bodyText ?? '')
-    .replace(/\u00A0/g, ' ')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\r/g, '')
-    .trim();
-
-  let renewPriceEGP = null;
-  {
-    const m = text.match(/Renewal Cost:\s*([\d.,]+)\s*EGP/i);
-    if (m) renewPriceEGP = numFromText(m[1]);
-  }
-
-  let renewalDate = null;
-  let remainingDays = null;
-  {
-    const m = text.match(/Renewal Date:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})\s*,?\s*(\d+)\s*Remaining Days/i);
-    if (m) {
-      renewalDate = m[1];
-      remainingDays = Number(m[2]);
-    }
-  }
-
-  let routerName = null;
-  let routerMonthlyEGP = null;
-  let routerRenewalDate = null;
-  {
-    const idx = text.toLowerCase().indexOf('premium router');
-    if (idx >= 0) {
-      const seg = text.slice(idx, idx + 1600);
-      routerName = 'PREMIUM Router';
-      const mPrice = seg.match(/Price:\s*([\d.,]+)\s*EGP/i);
-      if (mPrice) routerMonthlyEGP = numFromText(mPrice[1]);
-      const mDate = seg.match(/Renewal Date:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
-      if (mDate) routerRenewalDate = mDate[1];
-    }
-  }
-
-  return { renewPriceEGP, renewalDate, remainingDays, routerName, routerMonthlyEGP, routerRenewalDate };
-}
-
-// ========== NAV HELPERS ==========
-
-async function waitAccountOverviewReady(page) {
-  const checks = [
-    page.locator('text=/Usage Overview/i').first(),
-    page.locator('text=/Current Balance/i').first(),
-    page.locator('text=/Home Internet/i').first(),
-    page.locator('text=/Remaining/i').first(),
-  ];
-  for (let i = 0; i < 18; i += 1) {
-    for (const c of checks) {
-      if (await c.isVisible().catch(() => false)) return true;
-    }
-    await page.waitForTimeout(400).catch(() => {});
-  }
-  return false;
-}
-
-async function gotoAccountOverview(page) {
-  await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' });
-  await waitAccountOverviewReady(page).catch(() => {});
-}
-
-async function gotoOverviewPageMaybe(page) {
-  // بعد More Details عادة يروح #/overview
-  if (!/\/#\/overview/i.test(page.url())) {
-    await page.goto('https://my.te.eg/echannel/#/overview', { waitUntil: 'domcontentloaded' }).catch(() => {});
-  }
-  await page.waitForTimeout(1200).catch(() => {});
-}
-
-// ========== LOGIN HELPERS ==========
-
-// Keyboard-only selection to avoid viewport click issues
-async function selectInternetServiceType(page) {
-  debugLog('Selecting service type (keyboard)...');
-
-  const trigger = page.locator(SEL.selectServiceTypeTrigger).first();
-  await trigger.waitFor({ state: 'visible', timeout: LONG_TIMEOUT });
-  await trigger.click({ force: true });
-
-  const dropdown = page.locator('.ant-select-dropdown:visible');
-  await dropdown.waitFor({ state: 'visible', timeout: 15000 });
-
-  await page.keyboard.type('internet', { delay: 35 }).catch(() => {});
-  await page.waitForTimeout(250);
-  await page.keyboard.press('Enter').catch(() => {});
-  await page.waitForTimeout(250);
-
-  // ensure close (fallback arrow nav)
-  const stillOpen = await dropdown.isVisible().catch(() => false);
-  if (stillOpen) {
-    for (let i = 0; i < 20; i += 1) {
-      const active = dropdown.locator('.ant-select-item-option-active .ant-select-item-option-content').first();
-      const txt = await active.innerText().catch(() => '');
-      if (/internet/i.test(txt)) {
-        await page.keyboard.press('Enter').catch(() => {});
-        break;
-      }
-      await page.keyboard.press('ArrowDown').catch(() => {});
-      await page.waitForTimeout(120);
-    }
-  }
-
-  await dropdown.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {});
-}
-
-async function loginFlow(page, serviceNumber, password) {
-  await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: LONG_TIMEOUT });
-  await page.waitForSelector(SEL.inputService, { state: 'visible', timeout: LONG_TIMEOUT });
-
-  await page.click(SEL.inputService);
-  await page.fill(SEL.inputService, String(serviceNumber));
-
-  await selectInternetServiceType(page);
-
-  await page.waitForSelector(SEL.inputPassword, { state: 'visible', timeout: LONG_TIMEOUT });
-  await page.click(SEL.inputPassword);
-  await page.fill(SEL.inputPassword, String(password));
-
-  const loginBtn = page.locator(SEL.loginButton);
-  await loginBtn.waitFor({ state: 'visible', timeout: LONG_TIMEOUT });
-
-  debugLog('Clicking login button...');
-  await loginBtn.click({ force: true });
-
-  await Promise.race([
-    page.waitForURL(/accountoverview/i, { timeout: LONG_TIMEOUT }).catch(() => null),
-    page.locator('text=/Welcome|Usage Overview|Home Internet/i').first()
-      .waitFor({ state: 'visible', timeout: LONG_TIMEOUT }).catch(() => null),
-  ]);
-
-  await gotoAccountOverview(page);
-}
-
-// ========== PUBLIC API ==========
-
-async function loginAndSave(chatId, serviceNumber, password, retryCount = 0) {
-  return withLock(chatId, async () => {
-    const browser = await getBrowser();
-    const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    const page = await context.newPage();
-
-    page.setDefaultTimeout(LONG_TIMEOUT);
-    page.setDefaultNavigationTimeout(LONG_TIMEOUT);
-
-    try {
-      debugLog(`Starting login for ${chatId} (Attempt ${retryCount + 1}/${MAX_LOGIN_RETRIES})`);
-      await loginFlow(page, serviceNumber, password);
-
-      const sp = statePath(chatId);
-      await context.storageState({ path: sp });
-
-      const stateData = JSON.parse(fs.readFileSync(sp, 'utf8'));
-      await saveSession(chatId, stateData);
-      debugLog(`Session for ${chatId} persisted to Database.`);
-
-      diagnostics.set(String(chatId), {
-        lastError: null,
-        currentUrl: page.url(),
-        lastFetchAt: null,
-        methodPicked: 'LOGIN_OK',
-        moreDetailsVisible: null,
-      });
-
-      return true;
-    } catch (err) {
-      await safeShot(page, chatId, 'LOGIN_FAIL');
-      logger.error(`Login failed for ${chatId}`, err);
-
-      if (retryCount < MAX_LOGIN_RETRIES - 1) {
-        await context.close().catch(() => {});
-        await sleep(1500);
-        return loginAndSave(chatId, serviceNumber, password, retryCount + 1);
-      }
-      throw err;
-    } finally {
-      await context.close().catch(() => {});
-    }
-  });
-}
-
-async function autoRelogin(chatId) {
-  debugLog(`Attempting auto-relogin for ${chatId}...`);
-  const creds = await getCredentials(chatId);
-  if (!creds) throw new Error('NO_CREDENTIALS_SAVED');
-
-  await loginAndSave(chatId, creds.serviceNumber, creds.password);
-  debugLog(`Auto-relogin successful for ${chatId}`);
-  return true;
-}
-
-async function fetchWithSession(chatId, autoReloginAttempt = 0) {
-  return withLock(chatId, async () => {
-    const id = String(chatId);
-    const diag = diagnostics.get(id) || {};
-
-    const browser = await getBrowser();
-    const context = await browser.newContext({
-      storageState: await ensureStorageStateFile(chatId),
-      viewport: { width: 1280, height: 720 },
-    });
-    const page = await context.newPage();
-
-    page.setDefaultTimeout(90000);
-    page.setDefaultNavigationTimeout(90000);
-
-    try {
-      // 1) accountoverview -> basics
-      await gotoAccountOverview(page);
-
-      let basicsText = await page.locator('body').innerText().catch(() => '');
-      let basics = parseAccountOverviewText(basicsText);
-
-      if (basics.remainingGB == null || basics.usedGB == null || basics.balanceEGP == null) {
-        debugLog('Basics incomplete, reloading accountoverview once...');
-        await safeShot(page, chatId, 'BASICS_INCOMPLETE_BEFORE_RELOAD');
-        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-        await waitAccountOverviewReady(page).catch(() => {});
-        await page.waitForTimeout(1200).catch(() => {});
-        basicsText = await page.locator('body').innerText().catch(() => '');
-        basics = parseAccountOverviewText(basicsText);
-      }
-
-      // 2) click More Details -> overview -> details
-      let details = {
-        renewPriceEGP: null,
-        renewalDate: null,
-        remainingDays: null,
-        routerName: null,
-        routerMonthlyEGP: null,
-        routerRenewalDate: null,
-      };
-
-      let usedMoreDetails = false;
-      const more = page.getByText(/More Details/i).first();
-      const moreVisible = await more.isVisible().catch(() => false);
-
-      if (moreVisible) {
-        usedMoreDetails = true;
-        await more.scrollIntoViewIfNeeded().catch(() => {});
-        await more.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(1200).catch(() => {});
-        await gotoOverviewPageMaybe(page);
-
-        const detailsText = await page.locator('body').innerText().catch(() => '');
-        details = { ...details, ...parseOverviewDetailsText(detailsText) };
-      }
-
-      // renew button enabled? (on overview page usually)
-      const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
-      const renewVisible = await renewBtn.isVisible().catch(() => false);
-      const renewBtnEnabled = renewVisible
-        ? ((await renewBtn.getAttribute('disabled').catch(() => 'disabled')) === null)
-        : null;
-
-      const totalGB = (basics.usedGB != null && basics.remainingGB != null)
-        ? basics.usedGB + basics.remainingGB
-        : null;
-
-      const totalRenewEGP = ((details.renewPriceEGP ?? 0) + (details.routerMonthlyEGP ?? 0)) || null;
-      const canAfford = (totalRenewEGP != null && basics.balanceEGP != null)
-        ? basics.balanceEGP >= totalRenewEGP
-        : null;
-
-      const out = {
-        plan: basics.plan || '',
-        remainingGB: basics.remainingGB,
-        usedGB: basics.usedGB,
-        balanceEGP: basics.balanceEGP,
-
-        renewalDate: details.renewalDate,
-        remainingDays: details.remainingDays,
-        renewPriceEGP: details.renewPriceEGP,
-        renewBtnEnabled,
-
-        routerName: details.routerName,
-        routerMonthlyEGP: details.routerMonthlyEGP,
-        routerRenewalDate: details.routerRenewalDate,
-
-        totalGB,
-        totalRenewEGP,
-        canAfford,
-        capturedAt: new Date().toISOString(),
-        _pickedMethod: usedMoreDetails ? 'ACCOUNTOVERVIEW + OVERVIEW' : 'ACCOUNTOVERVIEW_ONLY',
-      };
-
-      diagnostics.set(id, {
-        ...diag,
-        lastError: null,
-        currentUrl: page.url(),
-        lastFetchAt: out.capturedAt,
-        methodPicked: out._pickedMethod,
-        moreDetailsVisible: usedMoreDetails,
-      });
-
-      return out;
-    } catch (err) {
-      const msg = String(err?.message || err || '');
-      diagnostics.set(id, {
-        ...diag,
-        lastError: msg,
-        currentUrl: page.url?.() || diag.currentUrl || null,
-      });
-
-      if (isSessionError(err) && autoReloginAttempt < MAX_AUTO_RELOGIN) {
-        debugLog(`Session error detected. Auto-relogin attempt ${autoReloginAttempt + 1}/${MAX_AUTO_RELOGIN}`);
-        try {
-          await context.close().catch(() => {});
-          await autoRelogin(chatId);
-          return fetchWithSession(chatId, autoReloginAttempt + 1);
-        } catch (reloginErr) {
-          throw new Error(`AUTO_RELOGIN_FAILED: ${reloginErr.message}`);
-        }
-      }
-
-      if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_FETCH');
-      throw err;
-    } finally {
-      await context.close().catch(() => {});
-    }
-  });
-}
-
-async function renewWithSession(chatId) {
-  return withLock(chatId, async () => {
-    const browser = await getBrowser();
-    const context = await browser.newContext({
-      storageState: await ensureStorageStateFile(chatId),
-      viewport: { width: 1280, height: 720 },
-    });
-    const page = await context.newPage();
-
-    page.setDefaultTimeout(90000);
-    page.setDefaultNavigationTimeout(90000);
-
-    try {
-      // renew غالبًا في overview
-      await page.goto('https://my.te.eg/echannel/#/overview', { waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.waitForTimeout(1200).catch(() => {});
-
-      const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
-      await renewBtn.waitFor({ state: 'visible', timeout: 20000 });
-      const dis = await renewBtn.getAttribute('disabled');
-      if (dis !== null) throw new Error('RENEW_DISABLED');
-
-      await renewBtn.click({ force: true });
-      await page.waitForTimeout(4000);
-      return true;
-    } catch (err) {
-      if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_RENEW');
-      throw err;
-    } finally {
-      await context.close().catch(() => {});
-    }
-  });
-}
-
-function getSessionDiagnostics(chatId) {
-  const id = String(chatId);
-  const d = diagnostics.get(id) || {};
-  return {
-    hasSessionFile: fs.existsSync(statePath(chatId)),
-    lastFetchAt: d.lastFetchAt || null,
-    lastError: d.lastError || null,
-    currentUrl: d.currentUrl || null,
-    methodPicked: d.methodPicked || null,
-    moreDetailsVisible: d.moreDetailsVisible ?? null,
+async function fetchWithSession(chatId) {
+  let browser;
+  const diagnostics = {
+    lastFetchAt: null,
+    lastError: null,
+    currentUrl: null,
+    methodPicked: null,
+    moreDetailsVisible: null,
+    hasState: false,
   };
+
+  try {
+    const state = readState(chatId);
+    diagnostics.hasState = !!state;
+
+    browser = await launchBrowser();
+    const ctx = await newContext(browser, state);
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(60000);
+
+    // 1) accountoverview
+    const url1 = await gotoAccountOverview(page);
+    diagnostics.currentUrl = url1;
+
+    // لو اتعمل redirect للـ signin يبقى session بايظة -> relogin
+    if (isProbablySignedOut(url1)) {
+      const creds = await getCredentials(chatId);
+      if (!creds) throw new Error('NO_CREDENTIALS');
+      await loginFlow(page, creds.serviceNumber, creds.password, chatId);
+    }
+
+    await dumpOnce(page, chatId, 'ACCOUNTOVERVIEW');
+
+    let body1 = await page.locator('body').innerText().catch(() => '');
+    let plan = await extractPlanSelector(page);
+    if (!plan) plan = extractPlan(body1);
+
+    let bal = await extractBalanceSelector(page);
+    if (bal == null) bal = extractBalance(body1);
+
+    // 2) overview usage page (sometimes remaining/used are more stable here)
+    await gotoUsagePage(page);
+    await dumpOnce(page, chatId, 'OVERVIEW');
+
+    let body2 = await page.locator('body').innerText().catch(() => '');
+    let usage = await extractUsageSelectors(page);
+    if (usage.remainingGB == null) usage = extractUsage(body2);
+
+    // Check if basics are still missing
+    const basicsIncomplete = !plan || usage.remainingGB == null || bal == null;
+    if (basicsIncomplete) {
+      dlog('Basics incomplete (Plan/Usage/Balance), trying one more wait/refresh...');
+      await page.waitForTimeout(3000);
+      body2 = await page.locator('body').innerText().catch(() => '');
+      if (!plan) plan = await extractPlanSelector(page) || extractPlan(body2);
+      if (usage.remainingGB == null) usage = await extractUsageSelectors(page) || extractUsage(body2);
+      if (bal == null) bal = await extractBalanceSelector(page) || extractBalance(body2);
+    }
+
+    // 3) More details (to get renewal/price/router)
+    await dumpOnce(page, chatId, 'BEFORE_MORE');
+    const opened = await openMoreDetails(page);
+    diagnostics.moreDetailsVisible = opened;
+    await dumpOnce(page, chatId, 'AFTER_MORE');
+
+    const body3 = await page.locator('body').innerText().catch(() => '');
+    const renewalInfo = extractRenewalInfo(body3);
+
+    // update state back
+    const newState = await ctx.storageState().catch(() => null);
+    if (newState) writeState(chatId, newState);
+
+    const data = buildResult({
+      plan,
+      remainingGB: usage.remainingGB,
+      usedGB: usage.usedGB,
+      balanceEGP: bal,
+      renewalInfo,
+    });
+
+    data._pickedMethod = opened ? 'ACCOUNTOVERVIEW + OVERVIEW' : 'ACCOUNTOVERVIEW + OVERVIEW(no-more)';
+
+    diagnostics.methodPicked = data._pickedMethod;
+    diagnostics.lastFetchAt = data.capturedAt;
+
+    await ctx.close().catch(() => {});
+    await browser.close().catch(() => {});
+    return data;
+  } catch (err) {
+    diagnostics.lastError = String(err?.message || err || '');
+    logger.error(`fetchWithSession failed for ${chatId}`, err);
+    throw err;
+  } finally {
+    try { await browser?.close?.(); } catch {}
+  }
+}
+
+async function renewWithSession() {
+  throw new Error('NOT_IMPLEMENTED');
 }
 
 async function deleteSession(chatId) {
-  return withLock(chatId, async () => {
-    const sp = statePath(chatId);
-    if (fs.existsSync(sp)) fs.unlinkSync(sp);
-    await deleteSessionRecord(chatId).catch(() => {});
-    debugLog(`Session for ${chatId} deleted from DB.`);
-    diagnostics.delete(String(chatId));
-    return true;
-  });
+  // ما تمسحش credentials هنا (ده في bot.js)
+  deleteState(chatId);
+  dlog(`Session for ${chatId} deleted locally (storageState).`);
+}
+
+function getSessionDiagnostics(chatId) {
+  return {
+    hasState: !!readState(chatId),
+    statePath: sessPath(chatId),
+  };
 }
 
 module.exports = {
@@ -556,7 +553,6 @@ module.exports = {
   fetchWithSession,
   renewWithSession,
   deleteSession,
-  getSessionDiagnostics,
-  autoRelogin,
   isSessionError,
+  getSessionDiagnostics,
 };

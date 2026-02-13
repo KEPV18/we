@@ -408,8 +408,9 @@ const server = app.listen(PORT, async () => {
 
   const domain = process.env.RENDER_EXTERNAL_URL;
   if (domain) {
-    await bot.telegram.setWebhook(`${domain}/telegram`);
-    logger.info(`Webhook set to ${domain}/telegram`);
+    const webhookUrl = domain.endsWith('/') ? `${domain}telegram` : `${domain}/telegram`;
+    await bot.telegram.setWebhook(webhookUrl);
+    logger.info(`Webhook set to ${webhookUrl}`);
   } else {
     logger.warn('No RENDER_EXTERNAL_URL, webhook not set automatically');
   }
