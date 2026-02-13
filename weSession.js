@@ -4,8 +4,12 @@ const { chromium } = require('playwright');
 const SEL = require('./selectors');
 
 const DEBUG = String(process.env.DEBUG_WE || '').trim() === '1';
+
 const userPool = new Map(); // chatId -> { context, page, diagnostics }
 let sharedBrowser = null;
+
+// Locks لمنع التداخل (مهم جدًا على Render)
+const sessionLocks = new Map(); // chatId -> Promise
 
 const {
   saveSession,
@@ -18,17 +22,17 @@ const logger = require('./logger');
 // ============ Constants ============
 const MAX_LOGIN_RETRIES = 3;
 const LONG_TIMEOUT = 120000;
-const SHORT_TIMEOUT = 30000;
 
 // Auto relogin
 const MAX_AUTO_RELOGIN = 2;
 
-// Render / Linux headless stability
+// Render stability args
 const BROWSER_LAUNCH_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
   '--disable-gpu',
+  '--single-process',
 ];
 
 function debugLog(...args) { if (DEBUG) console.log('[WE-DEBUG]', ...args); }
@@ -43,7 +47,7 @@ function debugShotPath(chatId, name) {
 
 async function safeShot(page, chatId, name) {
   try {
-    if (!DEBUG) return;
+    if (!DEBUG || !page) return;
     const p = debugShotPath(chatId, name);
     await page.screenshot({ path: p, fullPage: true }).catch(() => null);
     debugLog('Saved screenshot:', p);
@@ -82,6 +86,7 @@ function isMissingBrowserError(err) {
   return msg.includes("Executable doesn't exist at") || msg.includes('download new browsers');
 }
 
+// Session errors (نخلي BASICS_UNAVAILABLE مش Session Error عشان ما يعيدش login بلا لازمة)
 function isSessionError(err) {
   const msg = String(err?.message || err || '');
   return msg.includes('SESSION_EXPIRED') ||
@@ -90,7 +95,9 @@ function isSessionError(err) {
     msg.includes('Navigation failed') ||
     msg.includes('NO_SESSION') ||
     msg.includes('AUTO_RELOGIN_FAILED') ||
-    msg.includes('net::ERR');
+    msg.includes('net::ERR') ||
+    msg.includes('BROWSER_CLOSED_DURING_FETCH') ||
+    msg.includes('BROWSER_CLOSED_DURING_RENEW');
 }
 
 // ============ Sleep Utility ============
@@ -98,9 +105,29 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ============ Lock Utility ============
+async function withLock(chatId, fn) {
+  const id = String(chatId);
+  const prev = sessionLocks.get(id) || Promise.resolve();
+  let release;
+  const gate = new Promise(r => (release = r));
+  sessionLocks.set(id, prev.then(() => gate));
+
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    setTimeout(() => {
+      if (sessionLocks.get(id) === gate) sessionLocks.delete(id);
+    }, 0);
+  }
+}
+
 // ============ Browser Management ============
 async function getBrowser() {
   if (sharedBrowser?.isConnected()) return sharedBrowser;
+
   try {
     sharedBrowser = await chromium.launch({
       headless: true,
@@ -110,6 +137,7 @@ async function getBrowser() {
     if (isMissingBrowserError(err)) throw new Error('BROWSER_NOT_INSTALLED');
     throw err;
   }
+
   sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
   return sharedBrowser;
 }
@@ -131,6 +159,7 @@ async function closeUser(chatId) {
 async function ensureContext(chatId, forceNew = false) {
   const sp = statePath(chatId);
   const entry = getUserEntry(chatId);
+
   if (forceNew) await closeUser(chatId);
   if (entry.context) return entry.context;
 
@@ -171,21 +200,21 @@ async function ensurePage(chatId, forceNew = false) {
 }
 
 async function waitOverviewHealth(page) {
-  // انتظر أي marker من الصفحة بدل "networkidle"
+  // markers قوية
   const checks = [
-    page.locator('text=/Welcome,|Usage Overview|Home Internet/i').first(),
-    page.locator(SEL.remainingSpan, { hasText: SEL.remainingHasText }).first(),
-    page.locator(SEL.usedSpan, { hasText: SEL.usedHasText }).first(),
+    page.locator(SEL.markerUsageOverviewText).first(),
+    page.locator(SEL.markerHomeInternetText).first(),
+    page.locator(SEL.remainingLabel).first(),
+    page.locator(SEL.usedLabel).first(),
   ];
 
-  for (let i = 0; i < 10; i += 1) {
+  for (let i = 0; i < 14; i += 1) {
     for (const c of checks) {
       const ok = await c.isVisible().catch(() => false);
       if (ok) return true;
     }
-    await page.waitForTimeout(500).catch(() => { });
+    await page.waitForTimeout(450).catch(() => { });
   }
-
   return false;
 }
 
@@ -209,10 +238,10 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
   const currentUrl = page.url();
   entry.diagnostics.currentUrl = currentUrl;
 
-  // لو رجع signin يبقى session expired
   if (currentUrl.includes('/signin') || currentUrl.includes('#/home/signin')) {
-    await page.waitForTimeout(1200).catch(() => { });
+    await page.waitForTimeout(1000).catch(() => { });
     await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' }).catch(() => { });
+
     const url2 = page.url();
     entry.diagnostics.currentUrl = url2;
 
@@ -245,27 +274,22 @@ async function loginAndSave(chatId, serviceNumber, password, retryCount = 0) {
     debugLog(`Starting login for ${chatId} (Attempt ${retryCount + 1}/${MAX_LOGIN_RETRIES})`);
     await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: LONG_TIMEOUT });
 
-    // Wait form
     await page.waitForSelector(SEL.inputService, { state: 'visible', timeout: LONG_TIMEOUT });
 
-    // Fill service
     await page.click(SEL.inputService);
     await page.fill(SEL.inputService, String(serviceNumber));
 
-    // Select service type
     debugLog('Selecting service type...');
     const selectorTrigger = page.locator(SEL.selectServiceTypeTrigger).first();
     await selectorTrigger.waitFor({ state: 'visible', timeout: LONG_TIMEOUT });
     await selectorTrigger.click({ force: true });
 
-    // Wait dropdown
+    // dropdown
     await page.waitForSelector('.ant-select-dropdown', { timeout: LONG_TIMEOUT }).catch(() => {});
-
-    const internetOption = page.locator(SEL.selectServiceTypeInternet).filter({ hasText: /Internet/i }).first();
+    const internetOption = page.locator(SEL.selectServiceTypeInternet, { hasText: /Internet/i }).first();
     await internetOption.waitFor({ state: 'visible', timeout: LONG_TIMEOUT });
     await internetOption.click({ force: true });
 
-    // Fill password
     await page.waitForSelector(SEL.inputPassword, { state: 'visible', timeout: LONG_TIMEOUT });
     await page.click(SEL.inputPassword);
     await page.fill(SEL.inputPassword, String(password));
@@ -274,43 +298,33 @@ async function loginAndSave(chatId, serviceNumber, password, retryCount = 0) {
     await loginBtn.waitFor({ state: 'visible', timeout: LONG_TIMEOUT });
 
     debugLog('Clicking login button...');
-
-    // لا تعتمد على navigation event بس (SPA). استخدم URL + marker
     await loginBtn.click({ force: true });
 
-    // استنى يروح overview أو يظهر marker
+    // انتظر overview أو marker
     await Promise.race([
       page.waitForURL(/accountoverview/i, { timeout: LONG_TIMEOUT }).catch(() => null),
-      page.locator('text=/Welcome,|Usage Overview|Home Internet/i').first().waitFor({ state: 'visible', timeout: LONG_TIMEOUT }).catch(() => null),
+      page.locator(SEL.markerUsageOverviewText).first().waitFor({ state: 'visible', timeout: LONG_TIMEOUT }).catch(() => null),
+      page.locator(SEL.markerHomeInternetText).first().waitFor({ state: 'visible', timeout: LONG_TIMEOUT }).catch(() => null),
     ]);
 
     await page.waitForTimeout(1200);
-
     const url = page.url();
     debugLog(`Final URL after login: ${url}`);
 
-    // Fail if still signin with no marker
     if (url.includes('/signin') || url.includes('#/home/signin') || url.includes('login')) {
-      const errorMsg = await page.locator('.ant-message-notice, .error-message').innerText().catch(() => '');
-      if (errorMsg) throw new Error(`WE_SITE_ERROR: ${errorMsg}`);
-
-      const okMarker = await page.locator('text=/Welcome,|Usage Overview|Home Internet/i').first().isVisible().catch(() => false);
-      if (!okMarker) {
-        await safeShot(page, chatId, 'LOGIN_STILL_SIGNIN');
-        throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
-      }
+      await safeShot(page, chatId, 'LOGIN_STILL_SIGNIN');
+      throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
     }
 
-    // Ensure dashboard health before saving state
+    // نروح overview ونتأكد إنها صح قبل حفظ state
     await page.goto(SEL.overviewUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
     await waitOverviewHealth(page).catch(() => {});
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(700);
 
     const sp = statePath(chatId);
     ensureDir(path.dirname(sp));
     await context.storageState({ path: sp });
 
-    // Save to DB
     const stateData = JSON.parse(fs.readFileSync(sp, 'utf8'));
     await saveSession(chatId, stateData);
     debugLog(`Session for ${chatId} persisted to Database.`);
@@ -347,10 +361,10 @@ async function autoRelogin(chatId) {
 }
 
 async function openMoreDetailsResilient(page, chatId) {
-  const more = page.locator(SEL.moreDetailsSpan, { hasText: SEL.moreDetailsHasText }).first();
+  const more = page.locator(SEL.moreDetailsLabel).first();
 
   try {
-    await more.waitFor({ state: 'visible', timeout: 5000 });
+    await more.waitFor({ state: 'visible', timeout: 6000 });
   } catch {}
 
   for (let i = 0; i < 4; i += 1) {
@@ -370,7 +384,6 @@ async function openMoreDetailsResilient(page, chatId) {
     }
   }
 
-  // Fallback check
   const bodyText = await page.locator('body').innerText().catch(() => '');
   if (/Renewal\s*Date:/i.test(bodyText)) return { ok: true, fallback: true };
 
@@ -382,32 +395,38 @@ async function extractBasics(page) {
   const plan = await (async () => {
     const titles = page.locator('span[title]');
     const count = await titles.count().catch(() => 0);
-    for (let i = 0; i < Math.min(count, 60); i += 1) {
+    for (let i = 0; i < Math.min(count, 80); i += 1) {
       const t = await titles.nth(i).getAttribute('title').catch(() => null);
       if (t && t.length > 3 && t.length < 60 && !/Details|More/i.test(t)) return t.trim();
     }
     return '';
   })();
 
-  const remainingBox = page.locator(SEL.remainingSpan, { hasText: SEL.remainingHasText }).first().locator('xpath=..');
-  const usedBox = page.locator(SEL.usedSpan, { hasText: SEL.usedHasText }).first().locator('xpath=..');
-  const balBlock = page.locator(SEL.balanceText).locator('xpath=..');
+  let remainingGB = null;
+  try {
+    const box = page.locator(SEL.remainingLabel).first().locator('xpath=..');
+    remainingGB = numFromText(await box.innerText());
+  } catch {}
 
-  const remainingText = await remainingBox.innerText().catch(() => '');
-  const usedText = await usedBox.innerText().catch(() => '');
-  const balText = await balBlock.innerText().catch(() => '');
+  let usedGB = null;
+  try {
+    const box = page.locator(SEL.usedLabel).first().locator('xpath=..');
+    usedGB = numFromText(await box.innerText());
+  } catch {}
 
-  return {
-    plan,
-    remainingGB: numFromText(remainingText),
-    usedGB: numFromText(usedText),
-    balanceEGP: numFromText(balText),
-  };
+  let balanceEGP = null;
+  try {
+    const box = page.locator(SEL.balanceLabel).first().locator('xpath=..');
+    balanceEGP = numFromText(await box.innerText());
+  } catch {}
+
+  return { plan, remainingGB, usedGB, balanceEGP };
 }
 
 async function parseDetailsFromBody(page, bodyText, balanceEGP) {
   const parsed = parseRenewalLine(bodyText.match(/Renewal\s*Date:.*$/im)?.[0] || '');
   const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
+
   const renewVisible = await renewBtn.isVisible().catch(() => false);
   const renewBtnEnabled = renewVisible ? ((await renewBtn.getAttribute('disabled').catch(() => 'disabled')) === null) : null;
 
@@ -436,117 +455,117 @@ async function parseDetailsFromBody(page, bodyText, balanceEGP) {
 
 // ============ Main Fetch with Auto-Relogin ============
 async function fetchWithSession(chatId, autoReloginAttempt = 0) {
-  const entry = getUserEntry(chatId);
+  return withLock(chatId, async () => {
+    const entry = getUserEntry(chatId);
 
-  let page;
-  try {
-    page = await gotoOverview(chatId);
+    let page;
+    try {
+      page = await gotoOverview(chatId);
 
-    // انتظر health قوي قبل extract
-    await waitOverviewHealth(page).catch(() => {});
-    const basics = await extractBasics(page);
-
-    // If basics extraction failed, try "domcontentloaded reload" (مش networkidle)
-    if (basics.remainingGB === null && basics.usedGB === null) {
-      debugLog('Basics null, reloading page once...');
-      await safeShot(page, chatId, 'BASICS_NULL_BEFORE_RELOAD');
-      await page.reload({ waitUntil: 'domcontentloaded' });
       await waitOverviewHealth(page).catch(() => {});
-      await page.waitForTimeout(1200);
+      const basics = await extractBasics(page);
 
-      const basicsRetry = await extractBasics(page);
-      if (basicsRetry.remainingGB !== null || basicsRetry.usedGB !== null) {
-        Object.assign(basics, basicsRetry);
+      if (basics.remainingGB === null && basics.usedGB === null) {
+        debugLog('Basics null, reloading page once...');
+        await safeShot(page, chatId, 'BASICS_NULL_BEFORE_RELOAD');
+
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await waitOverviewHealth(page).catch(() => {});
+        await page.waitForTimeout(1200);
+
+        const basicsRetry = await extractBasics(page);
+        if (basicsRetry.remainingGB !== null || basicsRetry.usedGB !== null) {
+          Object.assign(basics, basicsRetry);
+        } else {
+          await safeShot(page, chatId, 'BASICS_NULL_AFTER_RELOAD');
+          throw new Error('BASICS_UNAVAILABLE');
+        }
+      }
+
+      let details = {
+        renewalDate: null,
+        remainingDays: null,
+        renewPriceEGP: null,
+        renewBtnEnabled: null,
+        routerName: null,
+        routerMonthlyEGP: null,
+        routerRenewalDate: null,
+        _detailsUnavailable: null,
+      };
+
+      const md = await openMoreDetailsResilient(page, chatId);
+      entry.diagnostics.moreDetailsVisible = md.ok;
+
+      if (md.ok) {
+        const bodyText = await page.locator('body').innerText().catch(() => '');
+        details = { ...details, ...(await parseDetailsFromBody(page, bodyText, basics.balanceEGP)) };
       } else {
-        await safeShot(page, chatId, 'BASICS_NULL_AFTER_RELOAD');
-
-        // هنا مش شرط session expired.. ممكن DOM تغيّر / bot detection
-        // نخلي الرسالة أوضح عشان ما يفضلش relogin بلا لازمة
-        throw new Error('BASICS_UNAVAILABLE');
+        details._detailsUnavailable = md.reason || 'DETAILS_TEMP_UNAVAILABLE';
       }
-    }
 
-    let details = {
-      renewalDate: null,
-      remainingDays: null,
-      renewPriceEGP: null,
-      renewBtnEnabled: null,
-      routerName: null,
-      routerMonthlyEGP: null,
-      routerRenewalDate: null,
-      _detailsUnavailable: null,
-    };
+      const totalRenewEGP = ((details.renewPriceEGP ?? 0) + (details.routerMonthlyEGP ?? 0)) || null;
+      const canAfford = totalRenewEGP != null && basics.balanceEGP != null ? basics.balanceEGP >= totalRenewEGP : null;
 
-    const md = await openMoreDetailsResilient(page, chatId);
-    entry.diagnostics.moreDetailsVisible = md.ok;
+      const totalGB = (basics.usedGB != null && basics.remainingGB != null)
+        ? basics.usedGB + basics.remainingGB
+        : null;
 
-    if (md.ok) {
-      const bodyText = await page.locator('body').innerText().catch(() => '');
-      details = { ...details, ...(await parseDetailsFromBody(page, bodyText, basics.balanceEGP)) };
-    } else {
-      details._detailsUnavailable = md.reason || 'DETAILS_TEMP_UNAVAILABLE';
-    }
+      const out = {
+        ...basics,
+        ...details,
+        totalGB,
+        totalRenewEGP,
+        canAfford,
+        capturedAt: new Date().toISOString(),
+        _pickedMethod: details._detailsUnavailable ? 'BASIC_ONLY' : 'BODY_PARSE',
+      };
 
-    const totalRenewEGP = ((details.renewPriceEGP ?? 0) + (details.routerMonthlyEGP ?? 0)) || null;
-    const canAfford = totalRenewEGP != null && basics.balanceEGP != null ? basics.balanceEGP >= totalRenewEGP : null;
+      entry.diagnostics.lastError = null;
+      entry.diagnostics.lastFetchAt = out.capturedAt;
+      entry.diagnostics.methodPicked = out._pickedMethod;
+      return out;
+    } catch (err) {
+      entry.diagnostics.lastError = String(err?.message || err || '');
 
-    const totalGB = (basics.usedGB != null && basics.remainingGB != null)
-      ? basics.usedGB + basics.remainingGB
-      : null;
-
-    const out = {
-      ...basics,
-      ...details,
-      totalGB,
-      totalRenewEGP,
-      canAfford,
-      capturedAt: new Date().toISOString(),
-      _pickedMethod: details._detailsUnavailable ? 'BASIC_ONLY' : 'BODY_PARSE',
-    };
-
-    entry.diagnostics.lastError = null;
-    entry.diagnostics.lastFetchAt = out.capturedAt;
-    entry.diagnostics.methodPicked = out._pickedMethod;
-    return out;
-  } catch (err) {
-    entry.diagnostics.lastError = String(err?.message || err || '');
-
-    // Auto-relogin فقط لو session فعلا expired، مش BASICS_UNAVAILABLE
-    if (isSessionError(err) && autoReloginAttempt < MAX_AUTO_RELOGIN) {
-      debugLog(`Session error detected. Auto-relogin attempt ${autoReloginAttempt + 1}/${MAX_AUTO_RELOGIN}`);
-      try {
-        await autoRelogin(chatId);
-        return fetchWithSession(chatId, autoReloginAttempt + 1);
-      } catch (reloginErr) {
-        debugLog(`Auto-relogin failed: ${reloginErr.message}`);
-        throw new Error(`AUTO_RELOGIN_FAILED: ${reloginErr.message}`);
+      // Auto-relogin فقط لsession errors، مش BASICS_UNAVAILABLE
+      if (isSessionError(err) && !String(err?.message || '').includes('BASICS_UNAVAILABLE') && autoReloginAttempt < MAX_AUTO_RELOGIN) {
+        debugLog(`Session error detected. Auto-relogin attempt ${autoReloginAttempt + 1}/${MAX_AUTO_RELOGIN}`);
+        try {
+          await autoRelogin(chatId);
+          return fetchWithSession(chatId, autoReloginAttempt + 1);
+        } catch (reloginErr) {
+          debugLog(`Auto-relogin failed: ${reloginErr.message}`);
+          throw new Error(`AUTO_RELOGIN_FAILED: ${reloginErr.message}`);
+        }
       }
-    }
 
-    if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_FETCH');
-    throw err;
-  }
+      if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_FETCH');
+      throw err;
+    }
+  });
 }
 
 async function renewWithSession(chatId) {
-  try {
-    const page = await gotoOverview(chatId);
-    const md = await openMoreDetailsResilient(page, chatId);
-    if (!md.ok) throw new Error(md.reason || 'MORE_DETAILS_NOT_FOUND');
+  return withLock(chatId, async () => {
+    try {
+      const page = await gotoOverview(chatId);
+      const md = await openMoreDetailsResilient(page, chatId);
+      if (!md.ok) throw new Error(md.reason || 'MORE_DETAILS_NOT_FOUND');
 
-    const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
-    await renewBtn.waitFor({ state: 'visible', timeout: 20000 });
+      const renewBtn = page.locator('button', { hasText: /Renew/i }).first();
+      await renewBtn.waitFor({ state: 'visible', timeout: 20000 });
 
-    const dis = await renewBtn.getAttribute('disabled');
-    if (dis !== null) throw new Error('RENEW_DISABLED');
+      const dis = await renewBtn.getAttribute('disabled');
+      if (dis !== null) throw new Error('RENEW_DISABLED');
 
-    await renewBtn.click({ force: true });
-    await page.waitForTimeout(5000);
-    return true;
-  } catch (err) {
-    if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_RENEW');
-    throw err;
-  }
+      await renewBtn.click({ force: true });
+      await page.waitForTimeout(5000);
+      return true;
+    } catch (err) {
+      if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_RENEW');
+      throw err;
+    }
+  });
 }
 
 function getSessionDiagnostics(chatId) {
