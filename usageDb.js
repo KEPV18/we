@@ -145,20 +145,41 @@ function getLastOfDay(chatId, day) {
 
 async function getTodayUsage(chatId, now = new Date()) {
   const day = now.toISOString().slice(0, 10);
-  const [first, last] = await Promise.all([
-    getFirstOfDay(chatId, day),
+  
+  // Previous day formatting
+  const yesterdayDate = new Date(now);
+  yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+  const yesterday = yesterdayDate.toISOString().slice(0, 10);
+
+  const [lastYesterday, lastToday] = await Promise.all([
+    getLastOfDay(chatId, yesterday),
     getLastOfDay(chatId, day),
   ]);
 
-  if (!first || !last) return { usage: 0, since: null };
-  if (first.usedGB == null || last.usedGB == null) return { usage: 0, since: null };
+  // If we have no data for today yet, return 0
+  if (!lastToday || lastToday.usedGB == null) return { usage: 0, since: null };
 
-  const delta = Number(last.usedGB) - Number(first.usedGB);
-  const usage = delta > 0 ? delta : 0;
+  let usage = 0;
+  let referenceLabel = 'start of day';
 
-  // Format "since" time (e.g., "3:30 PM")
-  const sinceDate = new Date(first.capturedAt);
-  const since = sinceDate.toLocaleTimeString('ar-EG', { hour: 'numeric', minute: '2-digit' });
+  if (lastYesterday && lastYesterday.usedGB != null) {
+    // Best Case: We have data from yesterday
+    const delta = Number(lastToday.usedGB) - Number(lastYesterday.usedGB);
+    usage = delta > 0 ? delta : 0;
+    referenceLabel = 'yesterday';
+  } else {
+     // Fallback: Use first of today if yesterday is missing
+     const firstToday = await getFirstOfDay(chatId, day);
+     if (firstToday && firstToday.usedGB != null) {
+        const delta = Number(lastToday.usedGB) - Number(firstToday.usedGB);
+        usage = delta > 0 ? delta : 0;
+        referenceLabel = 'first check today';
+     }
+  }
+
+  // Format "since" time
+  const lastUpdateDate = new Date(lastToday.capturedAt);
+  const since = lastUpdateDate.toLocaleTimeString('ar-EG', { hour: 'numeric', minute: '2-digit' });
 
   return { usage, since };
 }

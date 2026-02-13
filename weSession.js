@@ -186,14 +186,14 @@ async function loginAndSave(chatId, serviceNumber, password) {
 
   try {
     debugLog(`Starting login for ${chatId}`);
-    await page.goto(SEL.signinUrl, { waitUntil: 'networkidle', timeout: LONG_TIMEOUT });
+    await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: LONG_TIMEOUT });
 
     // Wait for the form to be ready
     await page.waitForSelector(SEL.inputService, { state: 'visible' });
 
-    // Type Service Number
+    // Type Service Number with explicit click
     await page.click(SEL.inputService);
-    await page.keyboard.type(String(serviceNumber), { delay: 50 });
+    await page.fill(SEL.inputService, String(serviceNumber));
 
     // Select Service Type (Internet)
     debugLog('Selecting service type...');
@@ -202,7 +202,7 @@ async function loginAndSave(chatId, serviceNumber, password) {
     await selectorTrigger.click({ force: true });
 
     // Wait for dropdown and pick 'Internet'
-    await page.waitForTimeout(1000);
+    // Improved: wait for the specific option to be stable
     const internetOption = page.locator(SEL.selectServiceTypeInternet).filter({ hasText: /Internet/i }).first();
     await internetOption.waitFor({ state: 'visible' });
     await internetOption.click();
@@ -210,20 +210,22 @@ async function loginAndSave(chatId, serviceNumber, password) {
     // Type Password
     await page.waitForSelector(SEL.inputPassword, { state: 'visible' });
     await page.click(SEL.inputPassword);
-    await page.keyboard.type(String(password), { delay: 50 });
+    await page.fill(SEL.inputPassword, String(password));
 
     // Click Login
     const loginBtn = page.locator(SEL.loginButton);
     await loginBtn.waitFor({ state: 'visible' });
 
     debugLog('Clicking login button...');
+
+    // Explicitly wait for navigation after click
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => { }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => debugLog('Navigation timeout or already there', e)),
       loginBtn.click({ force: true })
     ]);
 
     // Check if successful (URL change or specific element)
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(3000); // Give it a moment to settle
     const url = page.url();
     debugLog(`Final URL after login: ${url}`);
 
@@ -231,8 +233,12 @@ async function loginAndSave(chatId, serviceNumber, password) {
       // Check for error messages on page
       const errorMsg = await page.locator('.ant-message-notice, .error-message').innerText().catch(() => '');
       if (errorMsg) throw new Error(`WE_SITE_ERROR: ${errorMsg}`);
-      // Fallback error
-      throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
+
+      // Double check if we are actually logged in but URL didn't change as expected (SPA behavior)
+      const successMarker = await page.locator('text=/Welcome|Usage Overview|Home Internet/i').first().isVisible().catch(() => false);
+      if (!successMarker) {
+        throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
+      }
     }
 
     const sp = statePath(chatId);
@@ -257,21 +263,48 @@ async function loginAndSave(chatId, serviceNumber, password) {
 
 async function openMoreDetailsResilient(page, chatId) {
   const more = page.locator(SEL.moreDetailsSpan, { hasText: SEL.moreDetailsHasText }).first();
-  for (let i = 0; i < 6; i += 1) {
+
+  // Try finding it for a few seconds
+  try {
+    await more.waitFor({ state: 'visible', timeout: 5000 });
+  } catch (e) {
+    // If not visible immediately, we proceed to scroll logic
+  }
+
+  for (let i = 0; i < 4; i += 1) {
     const visible = await more.isVisible().catch(() => false);
     if (visible) {
       await more.scrollIntoViewIfNeeded().catch(() => { });
+      // Force click sometimes helps with overlapping elements
       await more.click({ force: true }).catch(() => { });
-      await page.waitForTimeout(1600);
-      const marker = await page.locator('text=/Renewal|Unsubscribe|Router|Renew/i').first().isVisible().catch(() => false);
-      if (marker) return { ok: true };
+
+      // Wait for content to appear
+      const marker = page.locator('text=/Renewal|Unsubscribe|Router|Renew/i').first();
+      try {
+        await marker.waitFor({ state: 'visible', timeout: 2500 });
+        return { ok: true };
+      } catch (e) {
+        // click might have failed, try again
+      }
+    } else {
+      // If not visible, scroll down a bit
+      await page.mouse.wheel(0, 500).catch(() => { });
+      await page.waitForTimeout(1000);
     }
-    await page.mouse.wheel(0, 900).catch(() => { });
-    await page.waitForTimeout(2000);
   }
 
+  // Fallback: Check if details are already open (sometimes state persists?)
   const bodyText = await page.locator('body').innerText().catch(() => '');
   if (/Renewal\s*Date:/i.test(bodyText)) return { ok: true, fallback: true };
+
+  // Last ditch effort: Try JS click
+  const visible = await more.isVisible().catch(() => false);
+  if (visible) {
+    await more.evaluate(node => node.click()).catch(() => { });
+    await page.waitForTimeout(1500);
+    const textAfter = await page.locator('body').innerText().catch(() => '');
+    if (/Renewal\s*Date:/i.test(textAfter)) return { ok: true, fallback: true };
+  }
 
   if (DEBUG) await page.screenshot({ path: debugShotPath(chatId, 'MORE_FAIL') }).catch(() => { });
   return { ok: false, reason: 'MORE_NOT_VISIBLE' };
