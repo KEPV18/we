@@ -2,7 +2,8 @@ const cron = require('node-cron');
 const logger = require('../logger');
 const { 
   fetchWithSession, 
-  getSessionDiagnostics 
+  getSessionDiagnostics,
+  isSessionError 
 } = require('../weSession');
 const { 
   getTodayUsage, 
@@ -98,8 +99,8 @@ class CronService {
       logger.error(`Error in ${type} status update for ${chatId}:`, err);
 
       // Check if it's a session error
-      if (err.message.includes('SESSION_EXPIRED') || err.message.includes('NO_SESSION')) {
-        logger.info(`Session expired for ${chatId}, trying auto-login...`);
+      if (isSessionError(err)) {
+        logger.info(`Session issue for ${chatId}, trying auto-login...`);
 
         const creds = await getCredentials(chatId);
         if (creds) {

@@ -145,7 +145,7 @@ function getLastOfDay(chatId, day) {
 
 async function getTodayUsage(chatId, now = new Date()) {
   const day = now.toISOString().slice(0, 10);
-  
+
   // Previous day formatting
   const yesterdayDate = new Date(now);
   yesterdayDate.setDate(yesterdayDate.getDate() - 1);
@@ -168,13 +168,13 @@ async function getTodayUsage(chatId, now = new Date()) {
     usage = delta > 0 ? delta : 0;
     referenceLabel = 'yesterday';
   } else {
-     // Fallback: Use first of today if yesterday is missing
-     const firstToday = await getFirstOfDay(chatId, day);
-     if (firstToday && firstToday.usedGB != null) {
-        const delta = Number(lastToday.usedGB) - Number(firstToday.usedGB);
-        usage = delta > 0 ? delta : 0;
-        referenceLabel = 'first check today';
-     }
+    // Fallback: Use first of today if yesterday is missing
+    const firstToday = await getFirstOfDay(chatId, day);
+    if (firstToday && firstToday.usedGB != null) {
+      const delta = Number(lastToday.usedGB) - Number(firstToday.usedGB);
+      usage = delta > 0 ? delta : 0;
+      referenceLabel = 'first check today';
+    }
   }
 
   // Format "since" time
@@ -290,6 +290,12 @@ function getCredentials(chatId) {
   });
 }
 
+function deleteCredentials(chatId) {
+  return new Promise((resolve, reject) => {
+    db.run(`DELETE FROM user_credentials WHERE chatId=?`, [String(chatId)], (e) => (e ? reject(e) : resolve(true)));
+  });
+}
+
 module.exports = {
   initUsageDb,
   insertSnapshot,
@@ -306,4 +312,5 @@ module.exports = {
   deleteUserState,
   saveCredentials,
   getCredentials,
+  deleteCredentials,
 };

@@ -15,6 +15,7 @@ const {
   fetchWithSession,
   renewWithSession,
   deleteSession,
+  isSessionError,
 } = require('./weSession');
 
 const {
@@ -27,6 +28,7 @@ const {
   deleteUserState,
   saveCredentials,
   getCredentials,
+  deleteCredentials,
 } = require('./usageDb');
 
 const { checkRateLimit } = require('./rateLimiter');
@@ -179,23 +181,24 @@ async function handleStatus(ctx, retryCount = 0) {
   } catch (err) {
     // 🔥 Improved Error Handling with Retry Limit
     const errMsg = String(err?.message || err || '');
-    const isSessionError = errMsg.includes('SESSION_EXPIRED') || errMsg.includes('BROWSER_CLOSED') || errMsg.includes('Target closed') || errMsg.includes('Navigation failed');
+    const sessionIssue = isSessionError(err) || errMsg.includes('AUTO_RELOGIN_FAILED');
 
-    if (isSessionError) {
+    if (sessionIssue) {
       if (retryCount >= 1) {
         logger.warn(`Auto-login loop detected for ${chatId}. Aborting.`);
-        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '❌ فشل تحديث البيانات بعد محاولة الدخول. من فضلك "تسجيل خروج" وادخل تاني.', { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-        else await ctx.reply('❌ فشل تحديث البيانات بعد محاولة الدخول. من فضلك "تسجيل خروج" وادخل تاني.', { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+        const failText = '❌ فشل تحديث البيانات بعد محاولة الدخول. ممكن الباسورد اتغير؟\nمن فضلك "تسجيل خروج" وادخل البيانات الجديدة.';
+        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, failText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+        else await ctx.reply(failText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
         return;
       }
 
-      logger.warn(`Session issue detected for ${chatId}: ${errMsg}. Attempting auto-login (Try ${retryCount + 1})...`);
+      logger.warn(`Session issue detected for ${chatId}: ${errMsg}. Checking credentials...`);
       const creds = await getCredentials(chatId);
+      
       if (creds) {
         try {
           if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '⏳ الجلسة انتهت، جاري إعادة الدخول تلقائياً...', { parse_mode: 'Markdown' });
-          // else msg = await ctx.reply('⏳ الجلسة انتهت، جاري إعادة الدخول تلقائياً...', { parse_mode: 'Markdown' }); // msg already exists or we don't spam
-
+          
           await loginAndSave(chatId, creds.serviceNumber, creds.password);
 
           // Retry fetch RECURSIVELY with incremented count
@@ -203,11 +206,16 @@ async function handleStatus(ctx, retryCount = 0) {
 
         } catch (loginErr) {
           logger.error(`Auto-login failed for ${chatId}`, loginErr);
-          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '❌ فشل الدخول التلقائي. من فضلك اربط الحساب تاني.', { parse_mode: 'Markdown' });
-          else await ctx.reply('❌ فشل الدخول التلقائي. من فضلك اربط الحساب تاني.', { parse_mode: 'Markdown' });
+          const loginFailText = `❌ فشل الدخول التلقائي: ${loginErr.message}\nمن فضلك اربط الحساب تاني باستخدام "تسجيل خروج" ثم "ربط حساب جديد".`;
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, loginFailText, { parse_mode: 'Markdown' });
+          else await ctx.reply(loginFailText, { parse_mode: 'Markdown' });
         }
       } else {
-        await handleError(ctx, err, 'status');
+        // No credentials saved, start linking wizard automatically
+        await saveUserState(chatId, { stage: 'AWAITING_SERVICE_NUMBER' });
+        const linkPrompt = '⚠️ مفيش حساب مربوط. من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):';
+        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, linkPrompt);
+        else await ctx.reply(linkPrompt);
       }
     } else {
       await handleError(ctx, err, 'status');
@@ -280,6 +288,7 @@ bot.action('link_account', async (ctx) => {
 bot.action('logout', async (ctx) => {
   const chatId = ctx.chat.id;
   await deleteSession(chatId);
+  await deleteCredentials(chatId); // 🔥 Also remove credentials
   cacheService.del(`status:${chatId}`);
   await ctx.answerCbQuery('تم الخروج').catch(() => { });
   try {

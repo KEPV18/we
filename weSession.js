@@ -8,15 +8,17 @@ const userPool = new Map(); // chatId -> { context, page, diagnostics }
 let sharedBrowser = null;
 
 const {
-  initUsageDb,
-  saveSnapshot,
-  getTodayUsage,
-  getAvgDailyUsage,
   saveSession,
   getSession,
   deleteSessionRecord,
+  getCredentials,
 } = require('./usageDb');
 const logger = require('./logger');
+
+// ============ Constants ============
+const MAX_LOGIN_RETRIES = 3;
+const LONG_TIMEOUT = 120000;
+const SHORT_TIMEOUT = 30000;
 
 function debugLog(...args) { if (DEBUG) console.log('[WE-DEBUG]', ...args); }
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
@@ -59,6 +61,23 @@ function isMissingBrowserError(err) {
   return msg.includes('Executable doesn\'t exist at') || msg.includes('download new browsers');
 }
 
+function isSessionError(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('SESSION_EXPIRED') || 
+         msg.includes('BROWSER_CLOSED') || 
+         msg.includes('Target closed') || 
+         msg.includes('Navigation failed') ||
+         msg.includes('NO_SESSION') ||
+         msg.includes('AUTO_RELOGIN_FAILED') ||
+         msg.includes('net::ERR');
+}
+
+// ============ Sleep Utility ============
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============ Browser Management ============
 async function getBrowser() {
   if (sharedBrowser?.isConnected()) return sharedBrowser;
   try {
@@ -90,7 +109,7 @@ async function ensureContext(chatId, forceNew = false) {
   if (forceNew) await closeUser(chatId);
   if (entry.context) return entry.context;
 
-  // 🔥 1. Check DB first (The Radical Solution)
+  // 1. Check DB first
   const dbSession = await getSession(chatId);
   if (dbSession) {
     debugLog(`Restoring session for ${chatId} from Database...`);
@@ -172,26 +191,25 @@ async function gotoOverview(chatId, { retryOnce = true } = {}) {
   return page;
 }
 
-async function loginAndSave(chatId, serviceNumber, password) {
+// ============ Login with Auto-Retry ============
+async function loginAndSave(chatId, serviceNumber, password, retryCount = 0) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 }
   });
   const page = await context.newPage();
 
-  // High timeouts for slow WE site
-  const LONG_TIMEOUT = 120000;
   page.setDefaultTimeout(LONG_TIMEOUT);
   page.setDefaultNavigationTimeout(LONG_TIMEOUT);
 
   try {
-    debugLog(`Starting login for ${chatId}`);
+    debugLog(`Starting login for ${chatId} (Attempt ${retryCount + 1}/${MAX_LOGIN_RETRIES})`);
     await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: LONG_TIMEOUT });
 
     // Wait for the form to be ready
     await page.waitForSelector(SEL.inputService, { state: 'visible' });
 
-    // Type Service Number with explicit click
+    // Type Service Number
     await page.click(SEL.inputService);
     await page.fill(SEL.inputService, String(serviceNumber));
 
@@ -202,7 +220,6 @@ async function loginAndSave(chatId, serviceNumber, password) {
     await selectorTrigger.click({ force: true });
 
     // Wait for dropdown and pick 'Internet'
-    // Improved: wait for the specific option to be stable
     const internetOption = page.locator(SEL.selectServiceTypeInternet).filter({ hasText: /Internet/i }).first();
     await internetOption.waitFor({ state: 'visible' });
     await internetOption.click();
@@ -218,23 +235,20 @@ async function loginAndSave(chatId, serviceNumber, password) {
 
     debugLog('Clicking login button...');
 
-    // Explicitly wait for navigation after click
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => debugLog('Navigation timeout or already there', e)),
       loginBtn.click({ force: true })
     ]);
 
-    // Check if successful (URL change or specific element)
-    await page.waitForTimeout(3000); // Give it a moment to settle
+    // Check if successful
+    await page.waitForTimeout(3000);
     const url = page.url();
     debugLog(`Final URL after login: ${url}`);
 
     if (url.includes('/signin') || url.includes('login')) {
-      // Check for error messages on page
       const errorMsg = await page.locator('.ant-message-notice, .error-message').innerText().catch(() => '');
       if (errorMsg) throw new Error(`WE_SITE_ERROR: ${errorMsg}`);
 
-      // Double check if we are actually logged in but URL didn't change as expected (SPA behavior)
       const successMarker = await page.locator('text=/Welcome|Usage Overview|Home Internet/i').first().isVisible().catch(() => false);
       if (!successMarker) {
         throw new Error('LOGIN_FAILED_URL_STILL_SIGNIN');
@@ -242,9 +256,10 @@ async function loginAndSave(chatId, serviceNumber, password) {
     }
 
     const sp = statePath(chatId);
+    ensureDir(path.dirname(sp));
     await context.storageState({ path: sp });
 
-    // 🔥 2. Save to DB AFTER saving to file
+    // Save to DB
     const stateData = JSON.parse(fs.readFileSync(sp, 'utf8'));
     await saveSession(chatId, stateData);
     debugLog(`Session for ${chatId} persisted to Database.`);
@@ -255,30 +270,50 @@ async function loginAndSave(chatId, serviceNumber, password) {
     const shotPath = debugShotPath(chatId, 'LOGIN_FAIL');
     await page.screenshot({ path: shotPath, fullPage: true }).catch(() => null);
     logger.error(`Login failed for ${chatId}. Screenshot saved to: ${shotPath}`, err);
+
+    // Retry logic
+    if (retryCount < MAX_LOGIN_RETRIES - 1) {
+      debugLog(`Retrying login... (${retryCount + 2}/${MAX_LOGIN_RETRIES})`);
+      await context.close().catch(() => { });
+      await sleep(2000); // Wait before retry
+      return loginAndSave(chatId, serviceNumber, password, retryCount + 1);
+    }
+    
     throw err;
   } finally {
     await context.close().catch(() => { });
   }
 }
 
+// ============ Auto Re-login Helper ============
+async function autoRelogin(chatId) {
+  debugLog(`Attempting auto-relogin for ${chatId}...`);
+  const creds = await getCredentials(chatId);
+  if (!creds) {
+    throw new Error('NO_CREDENTIALS_SAVED');
+  }
+  
+  await closeUser(chatId);
+  await loginAndSave(chatId, creds.serviceNumber, creds.password);
+  debugLog(`Auto-relogin successful for ${chatId}`);
+  return true;
+}
+
 async function openMoreDetailsResilient(page, chatId) {
   const more = page.locator(SEL.moreDetailsSpan, { hasText: SEL.moreDetailsHasText }).first();
 
-  // Try finding it for a few seconds
   try {
     await more.waitFor({ state: 'visible', timeout: 5000 });
   } catch (e) {
-    // If not visible immediately, we proceed to scroll logic
+    // If not visible immediately, proceed to scroll logic
   }
 
   for (let i = 0; i < 4; i += 1) {
     const visible = await more.isVisible().catch(() => false);
     if (visible) {
       await more.scrollIntoViewIfNeeded().catch(() => { });
-      // Force click sometimes helps with overlapping elements
       await more.click({ force: true }).catch(() => { });
 
-      // Wait for content to appear
       const marker = page.locator('text=/Renewal|Unsubscribe|Router|Renew/i').first();
       try {
         await marker.waitFor({ state: 'visible', timeout: 2500 });
@@ -287,17 +322,15 @@ async function openMoreDetailsResilient(page, chatId) {
         // click might have failed, try again
       }
     } else {
-      // If not visible, scroll down a bit
       await page.mouse.wheel(0, 500).catch(() => { });
       await page.waitForTimeout(1000);
     }
   }
 
-  // Fallback: Check if details are already open (sometimes state persists?)
+  // Fallback
   const bodyText = await page.locator('body').innerText().catch(() => '');
   if (/Renewal\s*Date:/i.test(bodyText)) return { ok: true, fallback: true };
 
-  // Last ditch effort: Try JS click
   const visible = await more.isVisible().catch(() => false);
   if (visible) {
     await more.evaluate(node => node.click()).catch(() => { });
@@ -316,7 +349,6 @@ async function extractBasics(page) {
     const count = await titles.count().catch(() => 0);
     for (let i = 0; i < Math.min(count, 60); i += 1) {
       const t = await titles.nth(i).getAttribute('title').catch(() => null);
-      // Relaxed regex to include more plan variations
       if (t && t.length > 3 && t.length < 50 && !t.includes('Details') && !t.includes('More')) return t.trim();
     }
     return '';
@@ -361,16 +393,18 @@ async function parseDetailsFromBody(page, bodyText, balanceEGP) {
   };
 }
 
-async function fetchWithSession(chatId) {
+// ============ Main Fetch with Auto-Relogin ============
+async function fetchWithSession(chatId, autoReloginAttempt = 0) {
   const entry = getUserEntry(chatId);
+  const MAX_AUTO_RELOGIN = 2;
+  
   let page;
   try {
     page = await gotoOverview(chatId);
     const basics = await extractBasics(page);
 
-    // FIX: If basics extraction totally failed (all nulls), page might be broken or session invalid
+    // If basics extraction failed, try reload
     if (basics.remainingGB === null && basics.usedGB === null) {
-      // Try one reload
       debugLog('Basics null, reloading page once...');
       await page.reload({ waitUntil: 'networkidle' });
       await page.waitForTimeout(3000);
@@ -378,8 +412,7 @@ async function fetchWithSession(chatId) {
       if (basicsRetry.remainingGB !== null) {
         Object.assign(basics, basicsRetry);
       } else {
-        // Still null?
-        throw new Error('SESSION_EXPIRED'); // Force re-login
+        throw new Error('SESSION_EXPIRED');
       }
     }
 
@@ -406,9 +439,15 @@ async function fetchWithSession(chatId) {
     const totalRenewEGP = ((details.renewPriceEGP ?? 0) + (details.routerMonthlyEGP ?? 0)) || null;
     const canAfford = totalRenewEGP != null && basics.balanceEGP != null ? basics.balanceEGP >= totalRenewEGP : null;
 
+    // Calculate totalGB from used + remaining
+    const totalGB = (basics.usedGB != null && basics.remainingGB != null) 
+      ? basics.usedGB + basics.remainingGB 
+      : null;
+
     const out = {
       ...basics,
       ...details,
+      totalGB,
       totalRenewEGP,
       canAfford,
       capturedAt: new Date().toISOString(),
@@ -421,6 +460,20 @@ async function fetchWithSession(chatId) {
     return out;
   } catch (err) {
     entry.diagnostics.lastError = String(err?.message || err || '');
+    
+    // Auto-relogin on session errors
+    if (isSessionError(err) && autoReloginAttempt < MAX_AUTO_RELOGIN) {
+      debugLog(`Session error detected. Auto-relogin attempt ${autoReloginAttempt + 1}/${MAX_AUTO_RELOGIN}`);
+      try {
+        await autoRelogin(chatId);
+        // Retry fetch after successful relogin
+        return fetchWithSession(chatId, autoReloginAttempt + 1);
+      } catch (reloginErr) {
+        debugLog(`Auto-relogin failed: ${reloginErr.message}`);
+        throw new Error(`AUTO_RELOGIN_FAILED: ${reloginErr.message}`);
+      }
+    }
+    
     if (isClosedContextError(err)) throw new Error('BROWSER_CLOSED_DURING_FETCH');
     throw err;
   }
@@ -463,7 +516,6 @@ async function deleteSession(chatId) {
   await closeUser(chatId).catch(() => { });
   if (fs.existsSync(sp)) fs.unlinkSync(sp);
 
-  // 🔥 3. Delete from DB
   await deleteSessionRecord(chatId).catch(() => { });
   debugLog(`Session for ${chatId} deleted from DB.`);
   return true;
@@ -475,4 +527,6 @@ module.exports = {
   renewWithSession,
   deleteSession,
   getSessionDiagnostics,
+  autoRelogin,
+  isSessionError,
 };
