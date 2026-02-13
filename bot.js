@@ -40,7 +40,8 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// Bot Instance
+// ✅ Telegraf instance
+// ملاحظة: handlerTimeout هنا مش بيحل مشكلة webhook timeout لو السيرفر بيرد متأخر
 const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 3600000 });
 
 // Init Services
@@ -65,36 +66,21 @@ function to2(n) {
 
 function formatStatus(data, todayUsage, avgUsage) {
   const remainingDays = data.remainingDays ?? '؟';
-
-  // Handle todayUsage object or number (backward compatibility)
   const todayVal = typeof todayUsage === 'object' ? todayUsage.usage : todayUsage;
 
-  // Calculate daily quota (remaining GB / remaining days)
   let dailyQuota = null;
   if (typeof remainingDays === 'number' && remainingDays > 0 && data.remainingGB != null) {
     dailyQuota = data.remainingGB / remainingDays;
   }
 
-  // Format Arabic date/time
   const now = new Date();
   const arabicDateTime = now.toLocaleString('ar-EG');
 
-  // === IMPORTANT: do NOT default missing values to 0 ===
-  const renewalPrice = (data.renewPriceEGP == null ? null : data.renewPriceEGP);
-  const routerPrice = (data.routerMonthlyEGP == null ? null : data.routerMonthlyEGP);
-
-  const totalExpected =
-    (renewalPrice == null && routerPrice == null)
-      ? null
-      : (Number(renewalPrice || 0) + Number(routerPrice || 0));
-
-  const currentBalance = (data.balanceEGP == null ? null : data.balanceEGP);
-
-  const canAfford =
-    (totalExpected == null || currentBalance == null)
-      ? null
-      : currentBalance >= totalExpected;
-
+  const renewalPrice = data.renewPriceEGP || 0;
+  const routerPrice = data.routerMonthlyEGP || 0;
+  const totalExpected = renewalPrice + routerPrice;
+  const currentBalance = data.balanceEGP || 0;
+  const canAfford = currentBalance >= totalExpected;
   const routerRenewalText = data.routerRenewalDate ? `(تجديده: ${data.routerRenewalDate})` : '';
 
   return `📶 WE Home Internet
@@ -111,7 +97,7 @@ function formatStatus(data, todayUsage, avgUsage) {
 - قسط الراوتر: ${to2(routerPrice)} EGP ${routerRenewalText}
 - الإجمالي المتوقع: ${to2(totalExpected)} EGP
 - الرصيد الحالي: ${to2(currentBalance)} EGP
-- هل الرصيد يكفي؟ ${canAfford == null ? 'غير متاح' : (canAfford ? '✅ نعم' : '❌ لا')}
+- هل الرصيد يكفي؟ ${canAfford ? '✅ نعم' : '❌ لا'}
 - آخر تحديث: ${arabicDateTime}`;
 }
 
@@ -121,6 +107,28 @@ function getMainKeyboard(chatId) {
     ['📅 استهلاك اليوم', '♻️ تجديد الباقة'],
     ['🔗 ربط حساب جديد', '🚪 تسجيل خروج']
   ]).resize();
+}
+
+// ✅ lock بسيط: يمنع status مرتين في نفس الوقت لنفس الشات
+const statusLocks = new Map(); // chatId -> Promise
+
+async function withChatLock(chatId, fn) {
+  const id = String(chatId);
+  const prev = statusLocks.get(id) || Promise.resolve();
+  let release;
+  const gate = new Promise(res => (release = res));
+  statusLocks.set(id, prev.then(() => gate));
+
+  try {
+    await prev;      // استنى اللي قبلك يخلص
+    return await fn();
+  } finally {
+    release();       // حرّر الدور
+    // تنظيف لو مفيش حد وراك
+    setTimeout(() => {
+      if (statusLocks.get(id) === gate) statusLocks.delete(id);
+    }, 0);
+  }
 }
 
 // ============ Handlers ============
@@ -138,7 +146,7 @@ async function handleLogout(ctx) {
   await deleteCredentials(chatId);
   cacheService.del(`status:${chatId}`);
 
-  if (ctx.callbackQuery) await ctx.answerCbQuery('تم الخروج').catch(() => {});
+  if (ctx.callbackQuery) await ctx.answerCbQuery('تم الخروج').catch(() => { });
 
   const text = '✅ تم تسجيل الخروج بنجاح ومسح جميع بياناتك.';
   try {
@@ -151,101 +159,109 @@ async function handleLogout(ctx) {
 async function handleStatus(ctx, retryCount = 0) {
   const chatId = ctx.chat.id;
 
-  // Don't fetch status if user is in the middle of linking
-  const state = await getUserState(chatId);
-  if (state && state.stage) {
-    logger.info(`Ignoring status request for ${chatId} - user in stage: ${state.stage}`);
-    return;
-  }
-
-  // Rate Limit
-  const limit = checkRateLimit(chatId);
-  if (!limit.allowed) {
-    return await ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
-  }
-
-  // Initial Message
-  let msg;
-  try {
-    if (retryCount === 0) {
-      msg = await ctx.reply('⏳ جاري جلب البيانات...', { parse_mode: 'Markdown' });
-    }
-  } catch (e) { /* ignore */ }
-
-  try {
-    // Try Cache First (only on first try)
-    if (retryCount === 0) {
-      const cachedData = cacheService.get(`status:${chatId}`);
-      if (cachedData) {
-        const text = formatStatus(cachedData.data, cachedData.today, cachedData.avg);
-        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
-        else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-        return;
-      }
+  return withChatLock(chatId, async () => {
+    // Don't fetch status if user is in the middle of linking
+    const state = await getUserState(chatId);
+    if (state && state.stage) {
+      logger.info(`Ignoring status request for ${chatId} - user in stage: ${state.stage}`);
+      return;
     }
 
-    // Fetch Fresh Data
-    const data = await fetchWithSession(chatId);
-    await saveSnapshot(chatId, data);
+    // Rate Limit
+    const limit = checkRateLimit(chatId);
+    if (!limit.allowed) {
+      return await ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
+    }
 
-    // Check Notifications
-    notificationService.checkAndNotify(data, chatId);
+    // Initial Message (quick feedback)
+    let msg;
+    try {
+      if (retryCount === 0) {
+        msg = await ctx.reply('⏳ جاري جلب البيانات...', { parse_mode: 'Markdown' });
+      }
+    } catch {}
 
-    const todayUsage = await getTodayUsage(chatId);
-    const avgUsage = await getAvgDailyUsage(chatId);
-
-    // Update Cache
-    cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
-
-    const text = formatStatus(data, todayUsage, avgUsage);
-    if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
-    else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-
-  } catch (err) {
-    const errMsg = String(err?.message || err || '');
-    const sessionIssue = isSessionError(err) || errMsg.includes('AUTO_RELOGIN_FAILED');
-
-    if (sessionIssue) {
-      if (retryCount >= 1) {
-        logger.warn(`Auto-login loop detected for ${chatId}. Aborting.`);
-        const failText = '❌ فشل تحديث البيانات بعد محاولة الدخول. ممكن الباسورد اتغير؟\nمن فضلك "تسجيل خروج" وادخل البيانات الجديدة.';
-        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, failText, { parse_mode: 'Markdown' });
-        else await ctx.reply(failText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
-        return;
+    try {
+      // Cache First
+      if (retryCount === 0) {
+        const cachedData = cacheService.get(`status:${chatId}`);
+        if (cachedData) {
+          const text = formatStatus(cachedData.data, cachedData.today, cachedData.avg);
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
+          else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+          return;
+        }
       }
 
-      logger.warn(`Session issue detected for ${chatId}: ${errMsg}. Checking credentials...`);
-      const creds = await getCredentials(chatId);
+      // Fetch Fresh Data (this is slow)
+      const data = await fetchWithSession(chatId);
+      await saveSnapshot(chatId, data);
 
-      if (creds) {
-        try {
-          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '⏳ الجلسة انتهت، جاري إعادة الدخول تلقائياً...', { parse_mode: 'Markdown' });
+      notificationService.checkAndNotify(data, chatId);
 
-          await loginAndSave(chatId, creds.serviceNumber, creds.password);
+      const todayUsage = await getTodayUsage(chatId);
+      const avgUsage = await getAvgDailyUsage(chatId);
 
-          return handleStatus(ctx, retryCount + 1);
+      cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
 
-        } catch (loginErr) {
-          logger.error(`Auto-login failed for ${chatId}`, loginErr);
-          const loginFailText = `❌ فشل الدخول التلقائي: ${loginErr.message}\nمن فضلك اربط الحساب تاني باستخدام "تسجيل خروج" ثم "ربط حساب جديد".`;
-          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, loginFailText, { parse_mode: 'Markdown' });
-          else await ctx.reply(loginFailText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+      const text = formatStatus(data, todayUsage, avgUsage);
+      if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
+      else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+
+    } catch (err) {
+      const errMsg = String(err?.message || err || '');
+      const sessionIssue = isSessionError(err) || errMsg.includes('AUTO_RELOGIN_FAILED');
+
+      if (sessionIssue) {
+        if (retryCount >= 1) {
+          logger.warn(`Auto-login loop detected for ${chatId}. Aborting.`);
+          const failText = '❌ فشل تحديث البيانات بعد محاولة الدخول. ممكن الباسورد اتغير؟\nمن فضلك "تسجيل خروج" وادخل البيانات الجديدة.';
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, failText, { parse_mode: 'Markdown' });
+          else await ctx.reply(failText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+          return;
+        }
+
+        logger.warn(`Session issue detected for ${chatId}: ${errMsg}. Checking credentials...`);
+        const creds = await getCredentials(chatId);
+
+        if (creds) {
+          try {
+            if (msg) {
+              await ctx.telegram.editMessageText(
+                chatId,
+                msg.message_id,
+                undefined,
+                '⏳ الجلسة انتهت، جاري إعادة الدخول تلقائياً...',
+                { parse_mode: 'Markdown' }
+              );
+            }
+
+            await loginAndSave(chatId, creds.serviceNumber, creds.password);
+
+            return handleStatus(ctx, retryCount + 1);
+
+          } catch (loginErr) {
+            logger.error(`Auto-login failed for ${chatId}`, loginErr);
+            const loginFailText = `❌ فشل الدخول التلقائي: ${loginErr.message}\nمن فضلك اربط الحساب تاني باستخدام "تسجيل خروج" ثم "ربط حساب جديد".`;
+            if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, loginFailText, { parse_mode: 'Markdown' });
+            else await ctx.reply(loginFailText, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+          }
+        } else {
+          await saveUserState(chatId, { stage: 'AWAITING_SERVICE_NUMBER' });
+          const linkPrompt = '⚠️ مفيش حساب مربوط. من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):';
+          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, linkPrompt);
+          else await ctx.reply(linkPrompt, getMainKeyboard(chatId));
         }
       } else {
-        await saveUserState(chatId, { stage: 'AWAITING_SERVICE_NUMBER' });
-        const linkPrompt = '⚠️ مفيش حساب مربوط. من فضلك ابعت رقم الخدمة (Service Number) المكون من كود المحافظة + الرقم (مثلاً: 022888XXXX):';
-        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, linkPrompt);
-        else await ctx.reply(linkPrompt, getMainKeyboard(chatId));
+        await handleError(ctx, err, 'status');
       }
-    } else {
-      await handleError(ctx, err, 'status');
     }
-  }
+  });
 }
 
 async function handleChart(ctx) {
   const chatId = ctx.chat.id;
-  if (ctx.callbackQuery) await ctx.answerCbQuery('📊 جاري رسم البيانات...');
+  if (ctx.callbackQuery) await ctx.answerCbQuery('📊 جاري رسم البيانات...').catch(() => {});
 
   try {
     const cached = cacheService.get(`status:${chatId}`);
@@ -266,7 +282,7 @@ async function handleChart(ctx) {
 
 async function handleToday(ctx) {
   const chatId = ctx.chat.id;
-  if (ctx.callbackQuery) await ctx.answerCbQuery();
+  if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
 
   try {
     const today = await getTodayUsage(chatId);
@@ -280,7 +296,7 @@ async function handleToday(ctx) {
 }
 
 async function handleRenew(ctx) {
-  if (ctx.callbackQuery) await ctx.answerCbQuery();
+  if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
   await ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
 }
 
@@ -348,7 +364,7 @@ bot.on('text', async (ctx) => {
       state.stage = 'LOGGING_IN';
       await saveUserState(chatId, state);
 
-      const loadingMsg = await ctx.reply('⏳ جاري تسجيل الدخول وحفظ الجلسة في قاعدة البيانات...', { parse_mode: 'Markdown' });
+      await ctx.reply('⏳ جاري تسجيل الدخول وحفظ الجلسة في قاعدة البيانات...', { parse_mode: 'Markdown' });
 
       try {
         await loginAndSave(chatId, state.serviceNumber, password);
@@ -372,10 +388,19 @@ bot.on('text', async (ctx) => {
 // ============ Webhook / Server ============
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 app.get('/', (req, res) => res.json({ status: 'OK', uptime: process.uptime() }));
-app.use(bot.webhookCallback('/telegram'));
+app.get('/health', (req, res) => res.status(200).send('ok'));
+
+// ✅ أهم تعديل: رد 200 فورًا ثم معالجة الـ update async
+app.post('/telegram', (req, res) => {
+  res.sendStatus(200);
+
+  bot.handleUpdate(req.body).catch((err) => {
+    logger.error('Webhook handleUpdate error', err);
+  });
+});
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, async () => {
@@ -412,4 +437,5 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
+// Export
 module.exports = { formatStatus };
