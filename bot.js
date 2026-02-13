@@ -157,6 +157,13 @@ async function handleLogout(ctx) {
 async function handleStatus(ctx, retryCount = 0) {
   const chatId = ctx.chat.id;
 
+  // Don't fetch status if user is in the middle of linking
+  const state = await getUserState(chatId);
+  if (state && state.stage) {
+    logger.info(`Ignoring status request for ${chatId} - user in stage: ${state.stage}`);
+    return;
+  }
+
   // Rate Limit
   const limit = checkRateLimit(chatId);
   if (!limit.allowed) {
@@ -316,24 +323,19 @@ bot.on('text', async (ctx) => {
 
   if (!state) {
     // Check for Reply Keyboard buttons or common keywords
-    if (text.includes('تحديث') || ['status', 'refresh'].includes(lowerText)) {
-      return handleStatus(ctx);
-    }
-    if (text.includes('رسم بياني') || ['chart', 'graph'].includes(lowerText)) {
-      return handleChart(ctx);
-    }
-    if (text.includes('استهلاك اليوم') || ['today', 'usage'].includes(lowerText)) {
-      return handleToday(ctx);
-    }
-    if (text.includes('تجديد الباقة') || ['renew'].includes(lowerText)) {
-      return handleRenew(ctx);
-    }
-    if (text.includes('ربط حساب') || ['link', 'setup'].includes(lowerText)) {
-      return handleLink(ctx);
-    }
-    if (text.includes('تسجيل خروج') || ['logout', 'exit'].includes(lowerText)) {
-      return handleLogout(ctx);
-    }
+    const isStatus = text.includes('تحديث') || text.includes('Status') || lowerText.includes('status') || lowerText.includes('refresh');
+    const isChart = text.includes('رسم بياني') || text.includes('Chart') || lowerText.includes('chart') || lowerText.includes('graph');
+    const isToday = text.includes('استهلاك اليوم') || text.includes('Today') || lowerText.includes('today') || lowerText.includes('usage');
+    const isRenew = text.includes('تجديد الباقة') || text.includes('Renew') || lowerText.includes('renew');
+    const isLink = text.includes('ربط حساب') || text.includes('Link') || lowerText.includes('link') || lowerText.includes('setup');
+    const isLogout = text.includes('تسجيل خروج') || text.includes('Logout') || lowerText.includes('logout') || lowerText.includes('exit');
+
+    if (isStatus) return handleStatus(ctx);
+    if (isChart) return handleChart(ctx);
+    if (isToday) return handleToday(ctx);
+    if (isRenew) return handleRenew(ctx);
+    if (isLink) return handleLink(ctx);
+    if (isLogout) return handleLogout(ctx);
 
     // Default fallback for private chats
     if (ctx.chat.type === 'private') {
@@ -354,19 +356,28 @@ bot.on('text', async (ctx) => {
     }
     else if (state.stage === 'AWAITING_PASSWORD') {
       const password = text;
-      await deleteUserState(chatId); // Clear state from DB
+      
+      // Update state to a "BUSY" mode instead of deleting immediately
+      state.stage = 'LOGGING_IN';
+      await saveUserState(chatId, state);
 
       const loadingMsg = await ctx.reply('⏳ جاري تسجيل الدخول وحفظ الجلسة في قاعدة البيانات...', { parse_mode: 'Markdown' });
 
       try {
         await loginAndSave(chatId, state.serviceNumber, password);
         await saveCredentials(chatId, state.serviceNumber, password); // 🔥 Save credentials for auto-login
-        await ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, '✅ تم ربط الحساب بنجاح! هجيبلك بياناتك دلوقتي...');
+        
+        // NOW we can safely delete the state
+        await deleteUserState(chatId);
+        
+        await ctx.reply('✅ مبروك! تم تسجيل الدخول وربط الحساب بنجاح. هبدأ دلوقتي أجيبلك تفاصيل استهلاك الباقة...', getMainKeyboard(chatId));
 
         // Auto-fetch status after link
-        await handleStatus(ctx);
+        return handleStatus(ctx);
       } catch (err) {
-        await ctx.telegram.editMessageText(chatId, loadingMsg.message_id, undefined, `❌ فشل ربط الحساب: ${err.message}\n\nتأكد من الرقم والباسورد وجرب تاني باستخدام /link`);
+        // Also clear state on failure so user can retry
+        await deleteUserState(chatId);
+        await ctx.reply(`❌ للأسف فشل ربط الحساب: ${err.message}\n\nتأكد من صحة رقم الخدمة والباسورد، وجرب مرة تانية بالضغط على زر "🔗 ربط حساب جديد".`, getMainKeyboard(chatId));
       }
     }
   } catch (err) {
