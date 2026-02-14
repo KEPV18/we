@@ -376,8 +376,17 @@ bot.on('text', async (ctx) => {
 
         return handleStatus(ctx);
       } catch (err) {
-        await deleteUserState(chatId);
-        await ctx.reply(`❌ للأسف فشل ربط الحساب: ${err.message}\n\nتأكد من صحة رقم الخدمة والباسورد، وجرب مرة تانية بالضغط على زر "🔗 ربط حساب جديد".`, getMainKeyboard(chatId));
+        const msg = String(err && err.message || '');
+        // If it's invalid credentials, keep the wizard so the user can retry password
+        if (/LOGIN_ERROR:/i.test(msg)) {
+          state.stage = 'AWAITING_PASSWORD';
+          await saveUserState(chatId, state);
+          const friendly = msg.replace(/^LOGIN_ERROR:\s*/i, '').trim() || 'Service number or password is incorrect';
+          await ctx.reply(`❌ البيانات غير صحيحة: ${friendly}\n\n🔁 من فضلك ابعت الباسورد تاني أو اكتب /cancel للإلغاء.`, { parse_mode: 'Markdown' });
+        } else {
+          await deleteUserState(chatId);
+          await ctx.reply(`❌ للأسف فشل ربط الحساب: ${msg}\n\nتأكد من صحة رقم الخدمة والباسورد، وجرب مرة تانية بالضغط على زر "🔗 ربط حساب جديد".`, getMainKeyboard(chatId));
+        }
       }
     }
   } catch (err) {
