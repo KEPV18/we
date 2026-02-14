@@ -323,7 +323,12 @@ bot.command('logout', handleLogout);
 // Linking Wizard Logic
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
-  const text = ctx.message.text.trim();
+  const rawText = ctx.message.text || '';
+  const normalizedText = rawText.replace(/\u00A0/g, ' ').trim();
+  const toAsciiDigits = (s) => s.replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[۰-۹]/g, (d) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
+  const sanitizeServiceNumber = (s) => toAsciiDigits(s).replace(/\D+/g, '');
+  const sanitizePassword = (s) => s.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  const text = normalizedText;
   const lowerText = text.toLowerCase();
   const state = await getUserState(chatId);
 
@@ -350,16 +355,17 @@ bot.on('text', async (ctx) => {
 
   try {
     if (state.stage === 'AWAITING_SERVICE_NUMBER') {
-      if (!/^\d+$/.test(text) || text.length < 7) {
+      const sn = sanitizeServiceNumber(text);
+      if (!/^\d+$/.test(sn) || sn.length < 7) {
         return await ctx.reply('⚠️ رقم الخدمة لازم يكون أرقام بس وطوله مناسب. جرب تاني:');
       }
-      state.serviceNumber = text;
+      state.serviceNumber = sn;
       state.stage = 'AWAITING_PASSWORD';
       await saveUserState(chatId, state);
       await ctx.reply('🔑 تمام، دلوقتي ابعت الباسورد (Password) بتاع حساب WE:');
     }
     else if (state.stage === 'AWAITING_PASSWORD') {
-      const password = text;
+      const password = sanitizePassword(text);
 
       state.stage = 'LOGGING_IN';
       await saveUserState(chatId, state);
