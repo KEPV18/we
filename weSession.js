@@ -233,9 +233,12 @@ async function dumpOnce(page, chatId, tag) {
 }
 
 async function launchBrowser() {
-  const headless = process.env.HEADLESS === '0' ? false : true;
+  const headlessEnv = (process.env.HEADLESS ?? process.env.WE_HEADLESS) || '1';
+  const headless = headlessEnv === '0' ? false : true;
+  const slowMo = process.env.PW_SLOWMO ? Number(process.env.PW_SLOWMO) : (headless ? 0 : 200);
   return chromium.launch({
     headless,
+    slowMo,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -270,32 +273,32 @@ async function gotoUsagePage(page) {
 }
 
 async function selectInternetServiceTypeKeyboard(page) {
-  // افتح dropdown
   await page.locator(SEL.selectServiceTypeTrigger).click({ timeout: 30000 });
-  await page.waitForTimeout(400);
-
-  // استخدم keyboard لتفادي viewport issues
-  // جرّب Down + Enter كذا مرة لحد ما يبقى المختار Internet
-  for (let i = 0; i < 6; i++) {
-    await page.keyboard.press('ArrowDown');
-    await page.waitForTimeout(120);
-    const body = await page.locator('body').innerText().catch(() => '');
-    if (/Internet/i.test(body)) {
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(300);
-      return true;
+  await page.waitForSelector(SEL.selectDropdownVisible, { timeout: 10000 }).catch(() => {});
+  const items = page.locator(`${SEL.selectDropdownVisible} ${SEL.selectServiceTypeOption}`);
+  const count = await items.count().catch(() => 0);
+  let idx = -1;
+  const re = /(Home\s*Internet|Internet|إنترنت|الإنترنت|Fixed\s*Broadband|ADSL)/i;
+  for (let i = 0; i < count; i++) {
+    const t = await items.nth(i).innerText().catch(() => '');
+    if (re.test(t)) { idx = i; break; }
+  }
+  if (idx === -1 && count >= 2) idx = 1;
+  if (idx === -1 && count >= 1) idx = 0;
+  if (idx === -1) return false;
+  const target = items.nth(idx);
+  await target.scrollIntoViewIfNeeded().catch(() => {});
+  await target.click({ force: true, timeout: 15000 });
+  await page.waitForTimeout(300);
+  const chosen = await page.locator(SEL.selectServiceTypeTrigger).innerText().catch(() => '');
+  if (!re.test(chosen)) {
+    if (count >= 2) {
+      await page.locator(SEL.selectServiceTypeTrigger).click({ timeout: 30000 }).catch(() => {});
+      const alt = items.nth(1);
+      await alt.click({ force: true, timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(200);
     }
   }
-
-  // fallback: حاول click داخل dropdown المرئي
-  const opt = page
-    .locator(SEL.selectDropdownVisible)
-    .locator(SEL.selectServiceTypeOption)
-    .filter({ hasText: /Internet/i })
-    .first();
-
-  await opt.scrollIntoViewIfNeeded().catch(() => {});
-  await opt.click({ force: true, timeout: 15000 });
   return true;
 }
 
