@@ -69,12 +69,24 @@ function extractPlan(body) {
 
 async function extractPlanSelector(page) {
   try {
-    // Look for first span with title (common pattern for plan name in WE)
+    // Strategy 1: Look for "Your Current Plan" header and get the next element
+    const header = page.locator('text=/Your Current Plan|نظامك الحالي/i').first();
+    if (await header.isVisible().catch(() => false)) {
+      // Often the plan name is in the parent or next sibling
+      const parentTxt = await header.locator('xpath=..').innerText().catch(() => '');
+      const lines = parentTxt.split('\n').map(l => l.trim()).filter(Boolean);
+      const headerIdx = lines.findIndex(l => /Your Current Plan|نظامك الحالي/i.test(l));
+      if (headerIdx !== -1 && lines[headerIdx + 1]) {
+        return lines[headerIdx + 1];
+      }
+    }
+
+    // Strategy 2: Look for spans with title (existing strategy)
     const titles = page.locator('span[title]');
     const count = await titles.count().catch(() => 0);
     for (let i = 0; i < Math.min(count, 10); i++) {
       const t = await titles.nth(i).getAttribute('title').catch(() => null);
-      if (t && t.length > 3 && t.length < 100 && !t.includes('Details') && !t.includes('More')) {
+      if (t && t.length > 3 && t.length < 100 && !/Details|More|مزيد|تفاصيل/i.test(t)) {
         return t.trim();
       }
     }
@@ -86,16 +98,36 @@ async function extractPlanSelector(page) {
 
 async function extractUsageSelectors(page) {
   try {
-    const remBox = page.locator('span', { hasText: /Remaining/i }).first().locator('xpath=..');
-    const usedBox = page.locator('span', { hasText: /Used/i }).first().locator('xpath=..');
+    // Look for the "Home Internet" block specifically
+    const homeInternetHeader = page.locator('text=/Home Internet|إنترنت منزلي/i').first();
+    let root = page;
+    if (await homeInternetHeader.isVisible().catch(() => false)) {
+      root = homeInternetHeader.locator('xpath=./ancestor::div[contains(@class, "ant-card") or contains(@class, "usage")] | ./following-sibling::div').first();
+      if (!(await root.isVisible().catch(() => false))) root = page;
+    }
+
+    const remBox = root.locator('span', { hasText: /Remaining|المتبقي/i }).first().locator('xpath=..');
+    const usedBox = root.locator('span', { hasText: /Used|المستخدم/i }).first().locator('xpath=..');
     
     const remTxt = await remBox.innerText().catch(() => '');
     const usedTxt = await usedBox.innerText().catch(() => '');
 
-    return {
+    const res = {
       remainingGB: normalizeNumber(remTxt),
       usedGB: normalizeNumber(usedTxt),
     };
+
+    // If still null, try without the parent locator
+    if (res.remainingGB === null) {
+      const directRem = await root.locator('span', { hasText: /Remaining|المتبقي/i }).first().innerText().catch(() => '');
+      res.remainingGB = normalizeNumber(directRem);
+    }
+    if (res.usedGB === null) {
+      const directUsed = await root.locator('span', { hasText: /Used|المستخدم/i }).first().innerText().catch(() => '');
+      res.usedGB = normalizeNumber(directUsed);
+    }
+
+    return res;
   } catch (err) {
     dlog('extractUsageSelectors error:', err.message);
   }
@@ -104,7 +136,7 @@ async function extractUsageSelectors(page) {
 
 async function extractBalanceSelector(page) {
   try {
-    const balBlock = page.locator('text=Current Balance').locator('xpath=..');
+    const balBlock = page.locator('text=/Current Balance|الرصيد الحالي/i').first().locator('xpath=..');
     const txt = await balBlock.innerText().catch(() => '');
     return normalizeNumber(txt);
   } catch (err) {
@@ -268,28 +300,69 @@ async function selectInternetServiceTypeKeyboard(page) {
 }
 
 async function loginFlow(page, serviceNumber, password, chatId) {
-  await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
-  await page.waitForTimeout(800);
+  try {
+    await page.goto(SEL.signinUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await page.waitForTimeout(800);
 
-  await page.click(SEL.inputService, { timeout: 60000 });
-  await page.fill(SEL.inputService, String(serviceNumber));
-  await page.waitForTimeout(300);
+    await page.click(SEL.inputService, { timeout: 60000 });
+    await page.fill(SEL.inputService, String(serviceNumber));
+    await page.waitForTimeout(300);
 
-  dlog('Selecting service type (keyboard)...');
-  await selectInternetServiceTypeKeyboard(page);
+    dlog('Selecting service type (keyboard)...');
+    await selectInternetServiceTypeKeyboard(page);
 
-  await page.click(SEL.inputPassword, { timeout: 60000 });
-  await page.fill(SEL.inputPassword, String(password));
-  await page.waitForTimeout(600);
+    await page.click(SEL.inputPassword, { timeout: 60000 });
+    await page.fill(SEL.inputPassword, String(password));
+    await page.waitForTimeout(600);
 
-  dlog('Clicking login button...');
-  await page.click(SEL.loginButton, { timeout: 60000 });
+    dlog('Clicking login button...');
+    // Force enable the login button if it's disabled
+    await page.evaluate((sel) => {
+      const btn = document.querySelector(sel);
+      if (btn) {
+        btn.removeAttribute('disabled');
+        btn.classList.remove('ant-btn-loading');
+      }
+    }, SEL.loginButton);
+    await page.waitForTimeout(200);
 
-  // استنى التحويل للـ accountoverview
-  await page.waitForURL(/accountoverview/i, { timeout: 90000 });
-  await page.waitForTimeout(1000);
+    await page.click(SEL.loginButton, { timeout: 60000, force: true });
+    // Fallback: press Enter in password field if click didn't work
+    await page.waitForTimeout(500);
+    const currentUrl = page.url();
+    if (currentUrl.includes('signin')) {
+      await page.focus(SEL.inputPassword).catch(() => {});
+      await page.keyboard.press('Enter').catch(() => {});
+    }
 
-  await dumpOnce(page, chatId, 'AFTER_LOGIN');
+    // استنى التحويل للـ accountoverview أو رسالة خطأ
+    try {
+      await Promise.race([
+        page.waitForURL(/accountoverview/i, { timeout: 90000 }),
+        page.waitForSelector('text=/Incorrect|invalid|wrong|failed|فشل|خطأ/i', { timeout: 90000 }).then(async (el) => {
+          const txt = await el.innerText();
+          throw new Error(`LOGIN_ERROR: ${txt}`);
+        }),
+      ]);
+    } catch (err) {
+      if (err.message.includes('LOGIN_ERROR')) throw err;
+      // If it's a timeout but we see an error on page, throw it
+      const body = await page.locator('body').innerText().catch(() => '');
+      if (/Incorrect|invalid|wrong|failed|فشل|خطأ/i.test(body)) {
+        const match = body.match(/(Incorrect service number or password|The password you entered is incorrect|بيانات الدخول غير صحيحة)/i);
+        throw new Error(`LOGIN_ERROR: ${match ? match[0] : 'Invalid credentials'}`);
+      }
+      throw err;
+    }
+
+    await page.waitForTimeout(1000);
+
+    await dumpOnce(page, chatId, 'AFTER_LOGIN');
+  } catch (err) {
+    dlog(`Login flow failed: ${err.message}`);
+    await dumpOnce(page, chatId, 'LOGIN_FAILED');
+    throw err;
+  }
 }
 
 async function openMoreDetails(page) {
