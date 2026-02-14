@@ -1,12 +1,4 @@
 // services/cronService.js
-init() {
-  if (process.env.DISABLE_CRON === '1') {
-    this.logger?.info?.('Cron disabled by DISABLE_CRON=1') || console.log('Cron disabled');
-    return;
-  }
-  // ... باقي init
-}
-
 const cron = require('node-cron');
 const logger = require('../logger');
 const { 
@@ -37,6 +29,11 @@ class CronService {
    * Initialize all cron jobs
    */
   init() {
+    if (process.env.DISABLE_CRON === '1') {
+      logger.info('Cron disabled by DISABLE_CRON=1');
+      return;
+    }
+
     // Hourly status update (every hour at minute 0)
     this.schedule('0 * * * *', async () => {
       await this.sendScheduledStatus('hourly');
