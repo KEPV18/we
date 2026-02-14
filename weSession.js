@@ -481,29 +481,43 @@ function isSessionError(err) {
 // ================== Public API (used by bot.js) ==================
 
 async function loginAndSave(chatId, serviceNumber, password) {
-  let browser;
-  try {
-    dlog(`Starting login for ${chatId} (Attempt 1/3)`);
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let browser;
+    try {
+      dlog(`Starting login for ${chatId} (Attempt ${attempt}/${maxAttempts})`);
+      browser = await launchBrowser();
+      const ctx = await browser.newContext();
+      const page = await ctx.newPage();
+      page.setDefaultTimeout(60000);
 
-    browser = await launchBrowser();
-    const ctx = await browser.newContext();
-    const page = await ctx.newPage();
-    page.setDefaultTimeout(60000);
+      await loginFlow(page, serviceNumber, password, chatId);
 
-    await loginFlow(page, serviceNumber, password, chatId);
+      // save storageState
+      const state = await ctx.storageState();
+      writeState(chatId, state);
+      dlog(`Session for ${chatId} persisted locally (storageState).`);
 
-    // save storageState
-    const state = await ctx.storageState();
-    writeState(chatId, state);
-    dlog(`Session for ${chatId} persisted locally (storageState).`);
-
-    await ctx.close().catch(() => {});
-    await browser.close().catch(() => {});
-    return true;
-  } catch (err) {
-    try { await browser?.close?.(); } catch {}
-    logger.error(`Login failed for ${chatId}`, err);
-    throw err;
+      await ctx.close().catch(() => {});
+      await browser.close().catch(() => {});
+      return true;
+    } catch (err) {
+      try { await browser?.close?.(); } catch {}
+      const msg = String(err && err.message || '');
+      // لا تعيد المحاولة مع بيانات غير صحيحة
+      if (/LOGIN_ERROR:/i.test(msg)) {
+        logger.error(`Login failed for ${chatId}`, err);
+        throw err;
+      }
+      // أعِد المحاولة فقط للأخطاء العابرة
+      if (attempt < maxAttempts) {
+        dlog(`Transient login error, will retry: ${msg}`);
+        await new Promise(res => setTimeout(res, 1500));
+        continue;
+      }
+      logger.error(`Login failed for ${chatId}`, err);
+      throw err;
+    }
   }
 }
 

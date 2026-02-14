@@ -319,6 +319,15 @@ bot.action('logout', handleLogout);
 bot.command('status', handleStatus);
 bot.command('link', handleLink);
 bot.command('logout', handleLogout);
+bot.command('cancel', async (ctx) => {
+  const chatId = ctx.chat.id;
+  try {
+    await deleteUserState(chatId);
+    await ctx.reply('✅ تم إلغاء العملية. تقدر تبدأ من جديد من القائمة.', getMainKeyboard(chatId));
+  } catch (e) {
+    await ctx.reply('تم الإلغاء.');
+  }
+});
 
 // Linking Wizard Logic
 bot.on('text', async (ctx) => {
