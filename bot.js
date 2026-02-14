@@ -73,16 +73,6 @@ function formatStatus(data, todayUsage, avgUsage) {
     dailyQuota = data.remainingGB / remainingDays;
   }
 
-  const now = new Date();
-  const arabicDateTime = now.toLocaleString('ar-EG');
-
-  const renewalPrice = data.renewPriceEGP || 0;
-  const routerPrice = data.routerMonthlyEGP || 0;
-  const totalExpected = renewalPrice + routerPrice;
-  const currentBalance = data.balanceEGP || 0;
-  const canAfford = currentBalance >= totalExpected;
-  const routerRenewalText = data.routerRenewalDate ? `(تجديده: ${data.routerRenewalDate})` : '';
-
   return `📶 WE Home Internet
 - الباقة: ${data.plan || 'غير متاح'}
 - المتبقي: ${to2(data.remainingGB)} GB
@@ -90,9 +80,19 @@ function formatStatus(data, todayUsage, avgUsage) {
 - استهلاك النهاردة: ${to2(todayVal)} GB
 - التجديد: ${data.renewalDate || 'غير متاح'} (متبقي ${remainingDays} يوم)
 - حصتك اليومية لحد التجديد: ${to2(dailyQuota)} GB/يوم
-- متوسط استهلاكك اليومي: ${to2(avgUsage)} GB/يوم
+- متوسط استهلاكك اليومي: ${to2(avgUsage)} GB/يوم`;
+}
 
-💳 تفاصيل التجديد
+function formatRenewalDetails(data) {
+  const renewalPrice = data.renewPriceEGP || 0;
+  const routerPrice = data.routerMonthlyEGP || 0;
+  const totalExpected = renewalPrice + routerPrice;
+  const currentBalance = data.balanceEGP || 0;
+  const canAfford = currentBalance >= totalExpected;
+  const routerRenewalText = data.routerRenewalDate ? `(تجديده: ${data.routerRenewalDate})` : '';
+  const now = new Date();
+  const arabicDateTime = now.toLocaleString('ar-EG');
+  return `💳 تفاصيل التجديد
 - سعر الباقة: ${to2(renewalPrice)} EGP
 - قسط الراوتر: ${to2(routerPrice)} EGP ${routerRenewalText}
 - الإجمالي المتوقع: ${to2(totalExpected)} EGP
@@ -100,7 +100,6 @@ function formatStatus(data, todayUsage, avgUsage) {
 - هل الرصيد يكفي؟ ${canAfford ? '✅ نعم' : '❌ لا'}
 - آخر تحديث: ${arabicDateTime}`;
 }
-
 function getMainKeyboard(chatId) {
   return Markup.keyboard([
     ['🔄 تحديث الآن', '📊 رسم بياني'],
@@ -186,9 +185,15 @@ async function handleStatus(ctx, retryCount = 0) {
       if (retryCount === 0) {
         const cachedData = cacheService.get(`status:${chatId}`);
         if (cachedData) {
-          const text = formatStatus(cachedData.data, cachedData.today, cachedData.avg);
-          if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
-          else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+          const text1 = formatStatus(cachedData.data, cachedData.today, cachedData.avg);
+          const text2 = formatRenewalDetails(cachedData.data);
+          if (msg) {
+            await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text1, { parse_mode: 'Markdown' });
+            await ctx.reply(text2, { parse_mode: 'Markdown' });
+          } else {
+            await ctx.reply(text1, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+            await ctx.reply(text2, { parse_mode: 'Markdown' });
+          }
           return;
         }
       }
@@ -204,9 +209,15 @@ async function handleStatus(ctx, retryCount = 0) {
 
       cacheService.set(`status:${chatId}`, { data, today: todayUsage, avg: avgUsage });
 
-      const text = formatStatus(data, todayUsage, avgUsage);
-      if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text, { parse_mode: 'Markdown' });
-      else await ctx.reply(text, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+      const text1 = formatStatus(data, todayUsage, avgUsage);
+      const text2 = formatRenewalDetails(data);
+      if (msg) {
+        await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text1, { parse_mode: 'Markdown' });
+        await ctx.reply(text2, { parse_mode: 'Markdown' });
+      } else {
+        await ctx.reply(text1, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+        await ctx.reply(text2, { parse_mode: 'Markdown' });
+      }
 
     } catch (err) {
       const errMsg = String(err?.message || err || '');
