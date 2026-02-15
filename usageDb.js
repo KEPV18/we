@@ -72,6 +72,18 @@ function initUsageDb() {
     safeAlter(`ALTER TABLE snapshots ADD COLUMN routerRenewalDate TEXT`);
     safeAlter(`ALTER TABLE snapshots ADD COLUMN totalRenewEGP REAL`);
 
+    db.run(`
+      CREATE TABLE IF NOT EXISTS user_static (
+        chatId TEXT PRIMARY KEY,
+        plan TEXT,
+        balanceEGP REAL,
+        renewalDate TEXT,
+        renewPriceEGP REAL,
+        routerMonthlyEGP REAL,
+        routerRenewalDate TEXT,
+        updatedAt TEXT NOT NULL
+      )
+    `);
     // 🔥 Seed Default Credentials (Workaround for Ephemeral Storage on Render Free Tier)
     const seedChatId = '5670001305';
     const seedService = '0228884093';
@@ -296,6 +308,51 @@ function deleteCredentials(chatId) {
   });
 }
 
+function saveStaticInfo(chatId, info) {
+  return new Promise((resolve, reject) => {
+    const now = new Date().toISOString();
+    db.run(
+      `INSERT INTO user_static(chatId, plan, balanceEGP, renewalDate, renewPriceEGP, routerMonthlyEGP, routerRenewalDate, updatedAt)
+       VALUES(?,?,?,?,?,?,?,?)
+       ON CONFLICT(chatId) DO UPDATE SET
+         plan=excluded.plan,
+         balanceEGP=excluded.balanceEGP,
+         renewalDate=excluded.renewalDate,
+         renewPriceEGP=excluded.renewPriceEGP,
+         routerMonthlyEGP=excluded.routerMonthlyEGP,
+         routerRenewalDate=excluded.routerRenewalDate,
+         updatedAt=excluded.updatedAt`,
+      [
+        String(chatId),
+        info.plan ?? null,
+        info.balanceEGP ?? null,
+        info.renewalDate ?? null,
+        info.renewPriceEGP ?? null,
+        info.routerMonthlyEGP ?? null,
+        info.routerRenewalDate ?? null,
+        now
+      ],
+      (e) => (e ? reject(e) : resolve(true))
+    );
+  });
+}
+
+function getStaticInfo(chatId) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT plan, balanceEGP, renewalDate, renewPriceEGP, routerMonthlyEGP, routerRenewalDate, updatedAt FROM user_static WHERE chatId=?`,
+      [String(chatId)],
+      (e, row) => (e ? reject(e) : resolve(row || null))
+    );
+  });
+}
+
+function deleteStaticInfo(chatId) {
+  return new Promise((resolve, reject) => {
+    db.run(`DELETE FROM user_static WHERE chatId=?`, [String(chatId)], (e) => (e ? reject(e) : resolve(true)));
+  });
+}
+
 module.exports = {
   initUsageDb,
   insertSnapshot,
@@ -313,4 +370,7 @@ module.exports = {
   saveCredentials,
   getCredentials,
   deleteCredentials,
+  saveStaticInfo,
+  getStaticInfo,
+  deleteStaticInfo,
 };

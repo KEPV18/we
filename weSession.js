@@ -606,7 +606,17 @@ async function fetchWithSession(chatId) {
     let bal = await extractBalanceSelector(page);
     if (bal == null) bal = extractBalance(body1);
 
-    // 2) overview usage page (sometimes remaining/used are more stable here)
+    // جرّب فتح التفاصيل هنا أولاً (بعض الحسابات يظهر فيها الزر في Overview)
+    let renewalInfo = null;
+    await dumpOnce(page, chatId, 'BEFORE_MORE_OVERVIEW');
+    let openedOverview = await openMoreDetails(page);
+    if (openedOverview) {
+      await dumpOnce(page, chatId, 'AFTER_MORE_OVERVIEW');
+      const bodyMore = await page.locator('body').innerText().catch(() => '');
+      renewalInfo = extractRenewalInfo(bodyMore);
+    }
+
+    // 2) overview usage page (sometimes remaining/used are more stable هنا)
     await gotoUsagePage(page);
     await dumpOnce(page, chatId, 'OVERVIEW');
 
@@ -625,14 +635,15 @@ async function fetchWithSession(chatId) {
       if (bal == null) bal = await extractBalanceSelector(page) || extractBalance(body2);
     }
 
-    // 3) More details (to get renewal/price/router)
-    await dumpOnce(page, chatId, 'BEFORE_MORE');
-    const opened = await openMoreDetails(page);
-    diagnostics.moreDetailsVisible = opened;
-    await dumpOnce(page, chatId, 'AFTER_MORE');
-
-    const body3 = await page.locator('body').innerText().catch(() => '');
-    const renewalInfo = extractRenewalInfo(body3);
+    // 3) More details (to get renewal/price/router) — جرب تاني من صفحة الاستخدام لو ما ظهرش قبل كده
+    if (!renewalInfo) {
+      await dumpOnce(page, chatId, 'BEFORE_MORE');
+      const opened = await openMoreDetails(page);
+      diagnostics.moreDetailsVisible = opened;
+      await dumpOnce(page, chatId, 'AFTER_MORE');
+      const body3 = await page.locator('body').innerText().catch(() => '');
+      renewalInfo = extractRenewalInfo(body3);
+    }
 
     // update state back
     const newState = await ctx.storageState().catch(() => null);
@@ -646,7 +657,7 @@ async function fetchWithSession(chatId) {
       renewalInfo,
     });
 
-    data._pickedMethod = opened ? 'ACCOUNTOVERVIEW + OVERVIEW' : 'ACCOUNTOVERVIEW + OVERVIEW(no-more)';
+    data._pickedMethod = diagnostics.moreDetailsVisible || openedOverview ? 'ACCOUNTOVERVIEW + OVERVIEW' : 'ACCOUNTOVERVIEW + OVERVIEW(no-more)';
 
     diagnostics.methodPicked = data._pickedMethod;
     diagnostics.lastFetchAt = data.capturedAt;
@@ -667,10 +678,117 @@ async function renewWithSession() {
   throw new Error('NOT_IMPLEMENTED');
 }
 
+// دمج تسجيل الدخول + الجلب في نفس جلسة المتصفح لتقليل الفتح/الإغلاق
+async function loginAndFetchOnce(chatId, serviceNumber, password) {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(60000);
+
+    await loginFlow(page, serviceNumber, password, chatId);
+
+    // بعد الدخول غالبًا نبقى بالفعل في accountoverview
+    await gotoAccountOverview(page).catch(() => {});
+    await dumpOnce(page, chatId, 'ACCOUNTOVERVIEW_ONESHOT');
+
+    let body1 = await page.locator('body').innerText().catch(() => '');
+    let plan = await extractPlanSelector(page);
+    if (!plan) plan = extractPlan(body1);
+
+    let bal = await extractBalanceSelector(page);
+    if (bal == null) bal = extractBalance(body1);
+
+    // جرّب فتح التفاصيل من الـ Overview أولاً
+    let renewalInfo = null;
+    await dumpOnce(page, chatId, 'BEFORE_MORE_OVERVIEW_ONESHOT');
+    let openedOverview = await openMoreDetails(page);
+    if (openedOverview) {
+      await dumpOnce(page, chatId, 'AFTER_MORE_OVERVIEW_ONESHOT');
+      const bodyMore = await page.locator('body').innerText().catch(() => '');
+      renewalInfo = extractRenewalInfo(bodyMore);
+    }
+
+    // usage overview
+    await gotoUsagePage(page).catch(() => {});
+    await dumpOnce(page, chatId, 'OVERVIEW_ONESHOT');
+
+    let body2 = await page.locator('body').innerText().catch(() => '');
+    let usage = await extractUsageSelectors(page);
+    if (usage.remainingGB == null) usage = extractUsage(body2);
+
+    // فتح مزيد من التفاصيل من صفحة الاستخدام لو ماجبناش حاجة قبل كده
+    if (!renewalInfo) {
+      await dumpOnce(page, chatId, 'BEFORE_MORE_ONESHOT');
+      const opened = await openMoreDetails(page);
+      await dumpOnce(page, chatId, 'AFTER_MORE_ONESHOT');
+      const body3 = await page.locator('body').innerText().catch(() => '');
+      renewalInfo = extractRenewalInfo(body3);
+    }
+
+    // حفظ الحالة
+    const state = await ctx.storageState().catch(() => null);
+    if (state) writeState(chatId, state);
+
+    const data = buildResult({
+      plan,
+      remainingGB: usage.remainingGB,
+      usedGB: usage.usedGB,
+      balanceEGP: bal,
+      renewalInfo,
+    });
+    data._pickedMethod = openedOverview ? 'ONE_BROWSER: OVERVIEW(first) + USAGE' : 'ONE_BROWSER: USAGE(only)';
+
+    await ctx.close().catch(() => {});
+    await browser.close().catch(() => {});
+    return data;
+  } catch (err) {
+    try { await browser?.close?.(); } catch {}
+    throw err;
+  }
+}
+
 async function deleteSession(chatId) {
   // ما تمسحش credentials هنا (ده في bot.js)
   deleteState(chatId);
   dlog(`Session for ${chatId} deleted locally (storageState).`);
+}
+
+async function fetchUsageOnly(chatId) {
+  let browser;
+  try {
+    const state = readState(chatId);
+    browser = await launchBrowser();
+    const ctx = await newContext(browser, state);
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(60000);
+
+    const url1 = await gotoAccountOverview(page);
+    if (isProbablySignedOut(url1)) {
+      const creds = await getCredentials(chatId);
+      if (!creds) throw new Error('NO_CREDENTIALS');
+      await loginFlow(page, creds.serviceNumber, creds.password, chatId);
+    }
+
+    await gotoUsagePage(page);
+    const body = await page.locator('body').innerText().catch(() => '');
+    let usage = await extractUsageSelectors(page);
+    if (usage.remainingGB == null) usage = extractUsage(body);
+
+    const data = {
+      remainingGB: usage.remainingGB,
+      usedGB: usage.usedGB,
+      capturedAt: new Date().toISOString(),
+    };
+
+    await ctx.close().catch(() => {});
+    await browser.close().catch(() => {});
+    return data;
+  } catch (err) {
+    try { await browser?.close?.(); } catch {}
+    throw err;
+  }
 }
 
 function getSessionDiagnostics(chatId) {
@@ -687,4 +805,6 @@ module.exports = {
   deleteSession,
   isSessionError,
   getSessionDiagnostics,
+  loginAndFetchOnce,
+  fetchUsageOnly,
 };

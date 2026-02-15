@@ -23,6 +23,8 @@ const {
   saveSnapshot,
   getTodayUsage,
   getAvgDailyUsage,
+  saveStaticInfo,
+  getStaticInfo,
   saveUserState,
   getUserState,
   deleteUserState,
@@ -102,9 +104,10 @@ function formatRenewalDetails(data) {
 }
 function getMainKeyboard(chatId) {
   return Markup.keyboard([
-    ['🔄 تحديث الآن', '📊 رسم بياني'],
-    ['📅 استهلاك اليوم', '♻️ تجديد الباقة'],
-    ['🔗 ربط حساب جديد', '🚪 تسجيل خروج']
+    ['⚡ استهلاك الآن', '🔄 تحديث المعلومات'],
+    ['📊 رسم بياني', '📅 استهلاك اليوم'],
+    ['♻️ تجديد الباقة', '🔗 ربط حساب جديد'],
+    ['🚪 تسجيل خروج']
   ]).resize();
 }
 
@@ -200,6 +203,14 @@ async function handleStatus(ctx, retryCount = 0) {
 
       // Fetch Fresh Data (this is slow)
       const data = await fetchWithSession(chatId);
+      await saveStaticInfo(chatId, {
+        plan: data.plan,
+        balanceEGP: data.balanceEGP,
+        renewalDate: data.renewalDate,
+        renewPriceEGP: data.renewPriceEGP,
+        routerMonthlyEGP: data.routerMonthlyEGP,
+        routerRenewalDate: data.routerRenewalDate,
+      });
       await saveSnapshot(chatId, data);
 
       notificationService.checkAndNotify(data, chatId);
@@ -306,6 +317,61 @@ async function handleToday(ctx) {
   }
 }
 
+async function handleQuickUsage(ctx) {
+  const chatId = ctx.chat.id;
+  return withChatLock(chatId, async () => {
+    const limit = checkRateLimit(chatId);
+    if (!limit.allowed) {
+      return await ctx.reply(`⏳ من فضلك انتظر ${limit.retryAfter} ثانية.`);
+    }
+    let msg;
+    try { msg = await ctx.reply('⏳ جاري جلب الاستهلاك...', { parse_mode: 'Markdown' }); } catch {}
+    try {
+      const staticInfo = await getStaticInfo(chatId);
+      if (!staticInfo) {
+        if (msg) await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, '⏳ لا توجد معلومات ثابتة محفوظة، سيتم التحديث الكامل...', { parse_mode: 'Markdown' });
+        return handleStatus(ctx);
+      }
+      const dyn = await fetchUsageOnly(chatId);
+      const data = {
+        plan: staticInfo.plan,
+        remainingGB: dyn.remainingGB,
+        usedGB: dyn.usedGB,
+        balanceEGP: staticInfo.balanceEGP,
+        renewalDate: staticInfo.renewalDate,
+        remainingDays: null,
+        renewPriceEGP: staticInfo.renewPriceEGP,
+        renewBtnEnabled: null,
+        routerName: null,
+        routerMonthlyEGP: staticInfo.routerMonthlyEGP,
+        routerRenewalDate: staticInfo.routerRenewalDate,
+        totalGB: null,
+        totalRenewEGP: staticInfo.renewPriceEGP != null && staticInfo.routerMonthlyEGP != null ? (staticInfo.renewPriceEGP + staticInfo.routerMonthlyEGP) : staticInfo.renewPriceEGP ?? null,
+        canAfford: null,
+        capturedAt: dyn.capturedAt,
+      };
+      await saveSnapshot(chatId, data);
+      const todayUsage = await getTodayUsage(chatId);
+      const avgUsage = await getAvgDailyUsage(chatId);
+      const text1 = formatStatus(data, todayUsage, avgUsage);
+      const text2 = formatRenewalDetails(data);
+      if (msg) {
+        await ctx.telegram.editMessageText(chatId, msg.message_id, undefined, text1, { parse_mode: 'Markdown' });
+        await ctx.reply(text2, { parse_mode: 'Markdown' });
+      } else {
+        await ctx.reply(text1, { parse_mode: 'Markdown', ...getMainKeyboard(chatId) });
+        await ctx.reply(text2, { parse_mode: 'Markdown' });
+      }
+    } catch (err) {
+      await handleError(ctx, err, 'quick_usage');
+    }
+  });
+}
+
+async function handleRefreshStatic(ctx) {
+  return handleStatus(ctx);
+}
+
 async function handleRenew(ctx) {
   if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
   await ctx.reply('⚠️ لتجديد الباقة، يرجى استخدام تطبيق WE الرسمي أو الكود *#999** لضمان الأمان حالياً.', { parse_mode: 'Markdown' });
@@ -353,6 +419,8 @@ bot.on('text', async (ctx) => {
   const state = await getUserState(chatId);
 
   if (!state) {
+    const isQuickUsage = text.includes('استهلاك الآن') || lowerText.includes('quick') || lowerText.includes('usage');
+    const isRefreshStatic = text.includes('تحديث المعلومات') || lowerText.includes('refresh all') || lowerText.includes('static');
     const isStatus = text.includes('تحديث') || text.includes('Status') || lowerText.includes('status') || lowerText.includes('refresh');
     const isChart = text.includes('رسم بياني') || text.includes('Chart') || lowerText.includes('chart') || lowerText.includes('graph');
     const isToday = text.includes('استهلاك اليوم') || text.includes('Today') || lowerText.includes('today') || lowerText.includes('usage');
@@ -360,7 +428,9 @@ bot.on('text', async (ctx) => {
     const isLink = text.includes('ربط حساب') || text.includes('Link') || lowerText.includes('link') || lowerText.includes('setup');
     const isLogout = text.includes('تسجيل خروج') || text.includes('Logout') || lowerText.includes('logout') || lowerText.includes('exit');
 
-    if (isStatus) return handleStatus(ctx);
+    if (isQuickUsage) return handleQuickUsage(ctx);
+    if (isRefreshStatic) return handleRefreshStatic(ctx);
+    if (isStatus) return handleQuickUsage(ctx);
     if (isChart) return handleChart(ctx);
     if (isToday) return handleToday(ctx);
     if (isRenew) return handleRenew(ctx);

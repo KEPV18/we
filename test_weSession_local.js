@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const { initUsageDb, saveCredentials } = require('./usageDb');
-const { loginAndSave, fetchWithSession, deleteSession, getSessionDiagnostics } = require('./weSession');
+const { loginAndSave, fetchWithSession, deleteSession, getSessionDiagnostics, loginAndFetchOnce } = require('./weSession');
 
 (async () => {
   const CHAT_ID = process.env.TEST_CHAT_ID || 'local-test';
@@ -28,29 +28,38 @@ const { loginAndSave, fetchWithSession, deleteSession, getSessionDiagnostics } =
 
     await saveCredentials(CHAT_ID, SERVICE, PASSWORD);
 
-    console.log('Logging in...');
-    await loginAndSave(CHAT_ID, SERVICE, PASSWORD);
-    console.log('✅ Login OK');
+    const useCombined = process.env.USE_COMBINED === '1';
+    if (useCombined) {
+      console.log('Logging in + Fetching in ONE browser...');
+      const data = await loginAndFetchOnce(CHAT_ID, SERVICE, PASSWORD);
+      console.log('✅ One-shot Fetch OK');
+      var resultData = data;
+    } else {
+      console.log('Logging in...');
+      await loginAndSave(CHAT_ID, SERVICE, PASSWORD);
+      console.log('✅ Login OK');
 
-    console.log('Fetching...');
-    const data = await fetchWithSession(CHAT_ID);
+      console.log('Fetching...');
+      const data = await fetchWithSession(CHAT_ID);
+      var resultData = data;
+    }
     console.log('✅ Fetch OK');
 
     const diag = getSessionDiagnostics(CHAT_ID);
 
     console.log('\n=== RESULT ===');
-    console.log(JSON.stringify(data, null, 2));
+    console.log(JSON.stringify(resultData, null, 2));
 
     console.log('\n=== DIAGNOSTICS ===');
     console.log(JSON.stringify(diag, null, 2));
 
     const missing = [];
-    if (data.remainingGB == null) missing.push('remainingGB');
-    if (data.usedGB == null) missing.push('usedGB');
-    if (data.balanceEGP == null) missing.push('balanceEGP');
-    if (data.renewPriceEGP == null) missing.push('renewPriceEGP');
-    if (!data.renewalDate) missing.push('renewalDate');
-    if (data.remainingDays == null) missing.push('remainingDays');
+    if (resultData.remainingGB == null) missing.push('remainingGB');
+    if (resultData.usedGB == null) missing.push('usedGB');
+    if (resultData.balanceEGP == null) missing.push('balanceEGP');
+    if (resultData.renewPriceEGP == null) missing.push('renewPriceEGP');
+    if (!resultData.renewalDate) missing.push('renewalDate');
+    if (resultData.remainingDays == null) missing.push('remainingDays');
 
     console.log('\n=== CHECKS ===');
     if (missing.length === 0) {
