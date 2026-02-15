@@ -57,6 +57,18 @@ function normalizeNumber(s) {
   return m ? Number(m[1]) : null;
 }
 
+function extractLabeledNumber(txt, labelRe) {
+  if (!txt) return null;
+  const x = String(txt);
+  const idx = x.search(labelRe);
+  if (idx >= 0) {
+    const right = x.slice(idx);
+    const m = right.match(/(\d+(\.\d+)?)/);
+    if (m) return Number(m[1]);
+  }
+  return normalizeNumber(x);
+}
+
 function extractPlan(body) {
   // Try regex first as fallback
   const m = body.match(/Your Current Plan\s*([\s\S]{0,80})/i);
@@ -113,18 +125,18 @@ async function extractUsageSelectors(page) {
     const usedTxt = await usedBox.innerText().catch(() => '');
 
     const res = {
-      remainingGB: normalizeNumber(remTxt),
-      usedGB: normalizeNumber(usedTxt),
+      remainingGB: extractLabeledNumber(remTxt, /(Remaining|المتبقي)/i),
+      usedGB: extractLabeledNumber(usedTxt, /(Used|المستخدم)/i),
     };
 
     // If still null, try without the parent locator
     if (res.remainingGB === null) {
       const directRem = await root.locator('span', { hasText: /Remaining|المتبقي/i }).first().innerText().catch(() => '');
-      res.remainingGB = normalizeNumber(directRem);
+      res.remainingGB = extractLabeledNumber(directRem, /(Remaining|المتبقي)/i);
     }
     if (res.usedGB === null) {
       const directUsed = await root.locator('span', { hasText: /Used|المستخدم/i }).first().innerText().catch(() => '');
-      res.usedGB = normalizeNumber(directUsed);
+      res.usedGB = extractLabeledNumber(directUsed, /(Used|المستخدم)/i);
     }
 
     return res;
@@ -146,12 +158,27 @@ async function extractBalanceSelector(page) {
 }
 
 function extractUsage(body) {
+  // ضيّق البحث حوالين "Home Internet" لو موجود
+  let scope = body;
   const idx = body.indexOf('Home Internet');
-  if (idx === -1) return { remainingGB: null, usedGB: null };
+  if (idx !== -1) scope = body.slice(idx, idx + 800);
 
-  const slice = body.slice(idx, idx + 500);
-  const rem = slice.match(/(\d+(\.\d+)?)\s*Remaining/i);
-  const used = slice.match(/(\d+(\.\d+)?)\s*Used/i);
+  // دعم عربي وإنجليزي
+  const remRe = /(\d+(\.\d+)?)\s*(Remaining|المتبقي)/i;
+  const usedRe = /(\d+(\.\d+)?)\s*(Used|المستخدم)/i;
+
+  let rem = scope.match(remRe);
+  let used = scope.match(usedRe);
+
+  // fallback: في بعض الصفحات الرقم ييجي بعد الكلمة
+  if (!rem) {
+    const rem2 = scope.match(/(Remaining|المتبقي)\s*[:\-]?\s*(\d+(\.\d+)?)/i);
+    if (rem2) rem = [rem2[0], rem2[2]];
+  }
+  if (!used) {
+    const used2 = scope.match(/(Used|المستخدم)\s*[:\-]?\s*(\d+(\.\d+)?)/i);
+    if (used2) used = [used2[0], used2[2]];
+  }
 
   return {
     remainingGB: rem ? Number(rem[1]) : null,
@@ -448,10 +475,25 @@ function buildResult({ plan, remainingGB, usedGB, balanceEGP, renewalInfo }) {
   const canAfford =
     (balanceEGP != null && totalRenewEGP != null) ? (balanceEGP >= totalRenewEGP) : null;
 
+  // تقدير المستخدم من الإجمالي - المتبقي لو المستخدم غير متاح
+  let usedResolved = usedGB;
+  if ((usedResolved == null || Number.isNaN(usedResolved)) && totalGB != null && remainingGB != null) {
+    const diff = totalGB - remainingGB;
+    usedResolved = diff >= 0 ? diff : null;
+  }
+  let remainingResolved = remainingGB;
+  const sumOk = (totalGB != null && remainingResolved != null && usedResolved != null) ?
+    Math.abs((remainingResolved + usedResolved) - totalGB) <= 1 : false;
+  if (sumOk && usedResolved > remainingResolved) {
+    const tmp = usedResolved;
+    usedResolved = remainingResolved;
+    remainingResolved = tmp;
+  }
+
   return {
     plan: plan || null,
-    remainingGB,
-    usedGB,
+    remainingGB: remainingResolved,
+    usedGB: usedResolved,
     balanceEGP,
     renewalDate,
     remainingDays,
