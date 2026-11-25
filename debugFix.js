@@ -19,7 +19,7 @@ async function testBot() {
   page.setDefaultTimeout(120000);
 
   const serviceNumber = '0228884093';
-  const password = 'Ahmed@19033';
+  const password = process.env.WE_PASSWORD;
 
   try {
     console.log('1. Opening login page...');
