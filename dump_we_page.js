@@ -18,7 +18,7 @@ function ts() {
 
   // ⚠️ حط بياناتك هنا مؤقتًا (أو خليها من env لو تحب)
   const SERVICE = '0228884093';
-  const PASSWORD = 'Ahmed@19033';
+  const PASSWORD = process.env.WE_PASSWORD;
 
   const stamp = ts();
 
