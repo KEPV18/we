@@ -5,7 +5,7 @@ const logger = require('./logger');
 async function test() {
   const testChatId = 'TEST_USER_123';
   const serviceNumber = '0228884093';
-  const password = 'Ahmed@19033';
+  const password = process.env.WE_PASSWORD;
 
   console.log('🚀 Starting Comprehensive Test...');
   
